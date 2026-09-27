@@ -72,6 +72,7 @@ from openfollow.marker_catalog import derive_station_name, save_catalog
 from openfollow.net_utils import get_local_ipv4_addresses
 from openfollow.network.adapter import Ipv4Config, Ipv4Method
 from openfollow.network.validate import parse_prefix, validate_apply
+from openfollow.palette import AUTO_PICK_ORDER
 from openfollow.templates import (
     TEMPLATE_FILE_SUFFIX,
     TEMPLATE_LEGACY_SUFFIX,
@@ -1954,18 +1955,41 @@ def _effective_default_marker_id(
     return min(candidates) if candidates else None
 
 
-def _osc_binding_marker_label(token: str, catalog: Any) -> str:
-    """Human label for one resolved ``markers`` token, shown in the row
-    summary badge + the nested secondary chips.
-
-    Numeric ids render as ``"<catalog name> (<id>)"`` (falling back to
-    ``"Marker <id>"``); controller aliases render as ``"Controller cN"``."""
-    if token.startswith("c"):
-        return f"Controller {token}"
-    mid = int(token)
+def _catalog_marker_label(mid: int, catalog: Any) -> str:
+    """``"<catalog name> (<id>)"``, falling back to ``Marker <id>``; a name that already carries
+    the id as a number (``Marker 5``, ``Truss 5 SL``) is not repeated as ``(5)``."""
     entry = catalog.get(mid) if catalog is not None else None
     name = (entry.name.strip() if entry is not None and entry.name else "") or f"Marker {mid}"
-    return f"{name} ({mid})"
+    return name if re.search(rf"(?<!\d){mid}(?!\d)", name) else f"{name} ({mid})"
+
+
+def _osc_binding_marker_label(token: str, catalog: Any) -> str:
+    """Human label for one resolved ``markers`` token, shown in the row
+    summary badge + the nested secondary chips: the catalog label for a
+    numeric id, ``"Controller cN"`` for a controller alias."""
+    if token.startswith("c"):
+        return f"Controller {token}"
+    return _catalog_marker_label(int(token), catalog)
+
+
+def _controller_slots_view(server: ConfigWebServer) -> dict[str, Any]:
+    """The Controller Slots snapshot with each slot's marker named and coloured as its HUD card is:
+    the catalog entry, or ``Marker <id>`` in the palette colour while the catalog has none."""
+    controllers = dict(server.get_runtime_stats().get("controllers") or {})
+    catalog = server.get_marker_catalog()
+    items = []
+    for item in controllers.get("items") or []:
+        item = dict(item)
+        if item.get("marker_id") is not None:
+            mid = int(item["marker_id"])
+            entry = catalog.get(mid) if catalog is not None else None
+            item["marker_label"] = _catalog_marker_label(mid, catalog)
+            item["marker_color"] = (
+                entry.color if entry is not None else AUTO_PICK_ORDER[mid % len(AUTO_PICK_ORDER)].lower()
+            )
+        items.append(item)
+    controllers["items"] = items
+    return controllers
 
 
 def _osc_binding_marker_entry(
@@ -4454,6 +4478,7 @@ def setup_routes(app: Bottle, server: ConfigWebServer) -> None:
             local=local,
             network_state=server.get_network_state(),
             stats=server.get_runtime_stats(),
+            controller_slots=_controller_slots_view(server),
             local_ips=_get_local_ips(),
             update_status=server.get_update_status(),
             # index.tpl includes the General partial directly, so the initial
@@ -4531,17 +4556,13 @@ def setup_routes(app: Bottle, server: ConfigWebServer) -> None:
     @app.get("/section/controller_slots")
     def get_controller_slots() -> Any:
         """The Controller Slots table, from the main loop's latest stats snapshot."""
-        return template(
-            "partials/controller_slots_table", controllers=server.get_runtime_stats().get("controllers", {})
-        )
+        return template("partials/controller_slots_table", controllers=_controller_slots_view(server))
 
     @app.post("/section/controller_slots/<action:re:identify|forget>/<index:int>")
     def controller_slot_action(action: str, index: int) -> Any:
         """Queue Identify / Forget for one slot; the main loop, which owns the slots, runs it."""
         server.request_slot_action(action, index, request.forms.get("ref", ""))
-        return template(
-            "partials/controller_slots_table", controllers=server.get_runtime_stats().get("controllers", {})
-        )
+        return template("partials/controller_slots_table", controllers=_controller_slots_view(server))
 
     @app.get("/section/video_source/failure")
     def get_video_source_failure() -> Any:

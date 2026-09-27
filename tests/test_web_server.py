@@ -413,7 +413,8 @@ def test_statistics_name_each_missing_controller(slots_server) -> None:
     _, base, _ = slots_server
     _, body = _get(base, "/section/statistics")
     assert "1 connected · 1 missing" in body
-    box = body[body.index('<div class="notice error" role="alert">') :]
+    # No role: the panel is swapped every second, and the announcer speaks the box.
+    box = body[body.index('<div class="notice error">') :]
     assert box.index("<div>C1 missing · marker 10 · GameSir (USB 2 · port 1)</div>") < box.index("</div>\n")
 
 
@@ -760,6 +761,8 @@ def test_video_source_failure_fragment_carries_the_box(live_server, monkeypatch)
     assert "Check the camera is powered." in body
     # Its own id namespace, or the Statistics poll steals the node.
     assert 'id="video-error-source-' in body
+    # The same polite live region as the section's own render of the box.
+    assert 'role="status" aria-live="polite" aria-atomic="true"' in body
     # The pipeline's own wording is not shown where there is a classification.
     assert "Could not open resource." not in body
 
@@ -1517,6 +1520,16 @@ def test_login_endpoint_remains_accessible_without_auth(pin_protected_server) ->
     status, body = _get(base, "/login")
     assert status == 200
     assert "pin" in body.lower()
+
+
+@pytest.mark.parametrize("pin", [None, "definitely-wrong"], ids=["page", "wrong-pin"])
+def test_the_login_page_shows_no_station_state(pin_protected_server, pin: str | None) -> None:
+    _, base, _ = pin_protected_server
+    status, body = _get(base, "/login") if pin is None else _post_form(base, "/login", {"pin": pin})
+    assert status == 200
+    assert 'id="statistics-section"' not in body
+    assert "/section/statistics" not in body
+    assert 'class="stat-panel"' not in body
 
 
 def test_privilege_modal_poll_unauth_returns_empty_no_redirect(pin_protected_server) -> None:
@@ -3241,15 +3254,20 @@ def test_auth_assets_path_bypasses_auth(pin_protected_server) -> None:
     assert status not in (401, 302, 303)
 
 
-def test_auth_statistics_path_bypasses_auth(pin_protected_server) -> None:
+@pytest.mark.parametrize("path", ["/section/statistics", "/section/statistics/alerts"])
+def test_auth_statistics_needs_the_pin(pin_protected_server, path: str) -> None:
+    """Station state (video source, errors, controller names) is not shown before login."""
     _, base, _ = pin_protected_server
-    req = urllib.request.Request(f"{base}/section/statistics", method="GET")
+    req = urllib.request.Request(f"{base}{path}", headers={"HX-Request": "true"}, method="GET")
     try:
         with urllib.request.urlopen(req, timeout=5) as r:
-            status = r.status
+            hx_redirect = r.headers.get("HX-Redirect", "")
+            body = r.read()
     except urllib.error.HTTPError as e:
-        status = e.code
-    assert status == 200
+        hx_redirect = e.headers.get("HX-Redirect", "")
+        body = e.read()
+    assert hx_redirect == "/login"
+    assert b'class="stat-panel"' not in body
 
 
 def test_auth_signed_request_over_declared_content_length_is_rejected(

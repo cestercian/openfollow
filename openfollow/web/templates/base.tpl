@@ -27,6 +27,7 @@
  <script src="/assets/js/color-picker.js?v={{_asset_v}}"></script>
  <script src="/assets/js/units.js?v={{_asset_v}}"></script>
  <script src="/assets/js/detect-input.js?v={{_asset_v}}"></script>
+ <script src="/assets/js/save-feedback.js?v={{_asset_v}}"></script>
  <style>
  :root {
  color-scheme: dark;
@@ -168,6 +169,20 @@
  0% { box-shadow: 0 0 0 2px rgba(125, 229, 159, 0.75); }
  100% { box-shadow: none; }
  }
+ /* A failed save: the same flash in red (save-feedback.js), plus its line. */
+ .save-failed { animation: flash-red .55s; }
+ @keyframes flash-red {
+ 0% { box-shadow: 0 0 0 2px rgba(255, 140, 140, 0.85); }
+ 100% { box-shadow: none; }
+ }
+ .save-error {
+ margin: 0.6rem 0 0;
+ color: #ff8a8a;
+ font-weight: 600;
+ font-size: 0.82rem;
+ line-height: 1.35;
+ }
+ .save-error a, .notice.error a { color: inherit; }
  .section-head {
  display: flex;
  align-items: center;
@@ -2091,6 +2106,18 @@
  </div>
  % end
  </header>
+ % if defined('host_refusal') and host_refusal:
+ <div class="notice error" role="alert">
+ <div>{{host_refusal.message}}</div>
+ <div class="notice-sub">{{get('host_refusal_note', 'Settings here can be viewed but not saved.')}}
+ % if host_refusal.href:
+ Open the station by its IP address: <a href="{{host_refusal.href}}">{{host_refusal.href}}</a>
+ % else:
+ Open the station by its IP address.
+ % end
+ </div>
+ </div>
+ % end
  {{!base}}
  % if defined('on_device') and on_device:
  <footer class="on-device-footer">
@@ -2442,6 +2469,7 @@
  if (closeBtn) closeBtn.hidden = !_modalDismissable;
  const card = root.querySelector('.modal-card');
  if (card) card.classList.toggle('modal-card-large', opts.size === 'large');
+ window.OpenFollow.saveError.clear(card);
  title.textContent = opts.title || '';
  // Wipe previous content. ``replaceChildren`` is the modern
  // single-call API and avoids the double-set ``innerHTML = ''``
@@ -2763,20 +2791,19 @@
  const url = '/api/templates/'
  + encodeURIComponent(tpl.filename)
  + '/apply' + (applyConfirm ? '?confirm=1' : '');
+ const saveError = window.OpenFollow.saveError;
+ const card = document.querySelector('#modal-root .modal-card');
  try {
  const res = await fetch(url, { method: 'POST' });
  if (!res.ok) {
- const text = await res.text();
- let msg = 'apply failed';
- try { msg = JSON.parse(text).error || msg; } catch (_) {}
- showToast(msg);
+ saveError.show(card, await saveError.fromResponse(res), 'Not applied.');
  return;
  }
  closeModal();
  showToast('Applied ' + tpl.name);
  if (typeof opts.onApplied === 'function') opts.onApplied(tpl);
  } catch (err) {
- showToast('Apply failed: ' + (err.message || 'unknown error'));
+ saveError.show(card, saveError.UNREACHABLE, 'Not applied.');
  }
  }
  async function onDeleteClick(tpl) {
@@ -2787,13 +2814,12 @@
  danger: true,
  });
  if (!ok) return;
+ const saveError = window.OpenFollow.saveError;
+ const card = document.querySelector('#modal-root .modal-card');
  try {
  const res = await fetch('/api/templates/' + encodeURIComponent(tpl.filename), { method: 'DELETE' });
  if (!res.ok) {
- const text = await res.text();
- let msg = 'delete failed';
- try { msg = JSON.parse(text).error || msg; } catch (_) {}
- showToast(msg);
+ saveError.show(card, await saveError.fromResponse(res), 'Not deleted.');
  return;
  }
  showToast('Deleted ' + tpl.name);
@@ -2801,7 +2827,7 @@
  // without re-opening the chooser.
  openTemplateChooser();
  } catch (err) {
- showToast('Delete failed: ' + (err.message || 'unknown error'));
+ saveError.show(card, saveError.UNREACHABLE, 'Not deleted.');
  }
  }
  async function onExportClick(tpl) {
@@ -2853,6 +2879,8 @@
  input.addEventListener('change', async () => {
  const file = input.files && input.files[0];
  if (!file) return;
+ const saveError = window.OpenFollow.saveError;
+ const card = document.querySelector('#modal-root .modal-card');
  try {
  const res = await fetch(
  '/api/templates/import?filename=' + encodeURIComponent(file.name),
@@ -2862,7 +2890,7 @@
  let data = {};
  try { data = JSON.parse(text); } catch (_) {}
  if (!res.ok || !data.ok) {
- showToast(data.error || 'Import failed (HTTP ' + res.status + ')');
+ saveError.show(card, saveError.fromText(res.status, text), 'Not imported.');
  return;
  }
  // A template of a different kind lands fine but won't show in
@@ -2875,7 +2903,7 @@
  }
  openTemplateChooser();
  } catch (err) {
- showToast('Import failed: ' + (err.message || 'unknown error'));
+ saveError.show(card, saveError.UNREACHABLE, 'Not imported.');
  }
  });
  input.click();
@@ -2942,6 +2970,8 @@
  // the operator-supplied name. ``onSaved`` fires on success so the
  // caller can refresh / toast.
  async function saveCurrentSectionAsTemplate(opts) {
+ const saveError = window.OpenFollow.saveError;
+ const box = saveError.origin();
  const name = await modalPrompt({
  title: opts.title || 'Save as template',
  label: 'Template name',
@@ -2956,17 +2986,15 @@
  body: JSON.stringify({ name }),
  });
  if (!res.ok) {
- const text = await res.text();
- let msg = 'save failed';
- try { msg = JSON.parse(text).error || msg; } catch (_) {}
- showToast(msg);
+ saveError.show(box, await saveError.fromResponse(res), 'Template not saved.');
  return;
  }
+ saveError.clear(box);
  const payload = await res.json();
  showToast('Saved ' + payload.name);
  if (typeof opts.onSaved === 'function') opts.onSaved(payload);
  } catch (err) {
- showToast('Save failed: ' + (err.message || 'unknown error'));
+ saveError.show(box, saveError.UNREACHABLE, 'Template not saved.');
  }
  }
  // Parse OSC diagnostic JSON response with fallback for non-JSON/HTTP errors.
@@ -3365,16 +3393,29 @@
  checkboxNames.forEach((key) => {
  if (!(key in data)) data[key] = false;
  });
+ const saveError = window.OpenFollow.saveError;
+ saveError.clear(form);
  fetch(`/api/config/${section}/broadcast`, {
  method: 'POST',
  headers: { 'Content-Type': 'application/json' },
  body: JSON.stringify(data),
- }).then((res) => res.json()).then((result) => {
- const failed = result.peer_results.filter((peer) => !peer.success);
- showToast(failed.length === 0
- ? `Saved and applied to ${result.peer_results.length} station(s)`
- : `Saved and applied to ${result.peer_results.length - failed.length}/${result.peer_results.length} stations`);
- }).catch(() => showToast('Broadcast failed'));
+ }).then(async (res) => {
+ if (!res.ok) {
+ saveError.show(form, await saveError.fromResponse(res));
+ return;
+ }
+ const peers = (await res.json()).peer_results;
+ const failed = peers.filter((peer) => !peer.success);
+ if (failed.length === 0) {
+ showToast(`Saved and applied to ${peers.length} station(s)`);
+ return;
+ }
+ saveError.show(form, {
+ error: `Saved here, but not applied on ${failed.length} of ${peers.length} stations: `
+ + failed.map((peer) => peer.name || peer.ip).join(', ') + '.',
+ action: 'Check that they are switched on, then apply again.',
+ }, '');
+ }).catch(() => saveError.show(form, saveError.UNREACHABLE));
  }
  // Disable Save/Broadcast buttons when form has aria-invalid inputs.
  // Scoped to actual form-submit / broadcast controls only.
@@ -3499,8 +3540,14 @@
  // immediately) then polls ``/api/info`` every 2 s until the
  // server comes back, at which point it reloads the page.
  function confirmRestartApp() {
+ const saveError = window.OpenFollow.saveError;
+ const box = saveError.origin();
  if (!confirm('Restart the application?')) return;
- fetch('/api/restart', {method: 'POST'}).then(function() {
+ fetch('/api/restart', {method: 'POST'}).then(async function(res) {
+ if (!res.ok) {
+ saveError.show(box, await saveError.fromResponse(res), 'Not restarted.');
+ return;
+ }
  var n = document.getElementById('top-restart-notice');
  if (n) n.style.display = 'block';
  var p = setInterval(function() {
@@ -3508,6 +3555,8 @@
  if (r.ok) { clearInterval(p); window.location.reload(); }
  }).catch(function() {});
  }, 2000);
+ }, function() {
+ saveError.show(box, saveError.UNREACHABLE, 'Not restarted.');
  });
  }
  // Toggle the <body> gate class. When turning off, uncheck the detection
@@ -4108,12 +4157,16 @@
  if (!rowId) return;
  const form = btn.closest('form');
  if (!form) return;
+ const saveError = window.OpenFollow.saveError;
  const nameInput = form.querySelector('input[name="name"]');
  const messageInput = form.querySelector('input[name="osc_message"]');
  const rowName = (nameInput && nameInput.value || '').trim();
  const message = (messageInput && messageInput.value || '').trim();
  if (!message) {
- showToast('OSC message is empty – fill it in before saving as a template');
+ saveError.show(form, {
+ error: 'The OSC message is empty.',
+ action: 'Fill it in before saving it as a template.',
+ }, 'Template not saved.');
  return;
  }
  // Pre-fill the modal with the row's own name so the operator
@@ -4151,13 +4204,10 @@
  },
  );
  if (!res.ok) {
- const text = await res.text();
- // The endpoint returns the bindings partial on success
- // and a small error partial on failure; surface a toast
- // either way without trying to parse JSON.
- showToast(text.length < 200 ? text : 'Save failed (HTTP ' + res.status + ')');
+ saveError.show(form, await saveError.fromResponse(res), 'Template not saved.');
  return;
  }
+ saveError.clear(form);
  showToast('Saved template "' + tplName + '"');
  // The endpoint returns the bindings-section partial in its
  // body – swap it in directly so the dropdown updates with
@@ -4184,7 +4234,7 @@
  }
  }
  } catch (err) {
- showToast('Save failed: ' + (err.message || 'unknown error'));
+ saveError.show(form, saveError.UNREACHABLE, 'Template not saved.');
  }
  });
  // Placeholder-chip insertion: works for both ``<input>`` and

@@ -715,14 +715,21 @@
         // any pending edits first so the test fires the address the
         // operator actually sees in the field, not whatever was last
         // saved. saveSelectedZone() returns a Promise.
-        saveSelectedZone().then(function() {
+        saveSelectedZone().then(function(saved) {
+            if (!saved) return null;
             var url = '/api/zones/' + idx + '/test_send'
                 + '?which=' + encodeURIComponent(which);
             return fetch(url, {method: 'POST'});
         }).then(function(r) {
+            if (!r) return null;
             return r.text().then(function(body) { return {ok: r.ok, body: body}; });
         }).then(function(res) {
             if (!pre) return;
+            if (!res) {
+                // Not sent: the line under the actions says why the save failed.
+                pre.setAttribute('hidden', '');
+                return;
+            }
             try {
                 pre.textContent = JSON.stringify(JSON.parse(res.body), null, 2);
             } catch (_) {
@@ -783,9 +790,11 @@
         var idx = state.selectedIndex;
         // Persist any pending edits before cloning so the copy matches
         // what the operator currently sees in the form.
-        saveSelectedZone().then(function() {
-            return fetch('/api/zones/' + idx + '/duplicate', {method: 'POST'});
-        }).then(function(r) { return r.ok ? r.json() : null; })
+        saveSelectedZone().then(function(saved) {
+            if (!saved) return null;
+            return zoneWrite(fetch('/api/zones/' + idx + '/duplicate', {method: 'POST'}),
+                detailsEl.querySelector('.actions'));
+        }).then(function(r) { return r ? r.json() : null; })
           .then(function(data) {
               if (!data) return;
               if (typeof data.index === 'number') {
@@ -953,14 +962,33 @@
         return parsed;
     }
 
-    // Returns Promise once save round-trip lands (or rejects on error).
-    // Chained from Duplicate and Test send so they reflect current
-    // form state, not last-saved snapshot.
+    // Resolves to the response when the write landed; otherwise shows why on
+    // the editor (under ``near``, default its last actions row) and resolves
+    // to null.
+    function zoneWrite(request, near) {
+        var saveError = window.OpenFollow.saveError;
+        var editor = document.getElementById('zone-editor-section');
+        return request.then(async function(r) {
+            if (r.ok) {
+                saveError.clear(editor);
+                return r;
+            }
+            saveError.show(editor, await saveError.fromResponse(r), 'Not saved.', near);
+            return null;
+        }, function() {
+            saveError.show(editor, saveError.UNREACHABLE, 'Not saved.', near);
+            return null;
+        });
+    }
+
+    // Resolves the save's Response, or null when nothing was saved.
+    // Duplicate and Test send chain on it and stop on null, so they act
+    // on the form the operator sees, never an older saved state.
     function saveSelectedZone() {
-        if (state.selectedIndex < 0) return Promise.resolve();
+        if (state.selectedIndex < 0) return Promise.resolve(null);
         var idx = state.selectedIndex;
         var z = state.zones[idx];
-        if (!z) return Promise.resolve();
+        if (!z) return Promise.resolve(null);
         var body = collectDetailFields();
         // Refuse to save when
         // ``triggered_by`` has any invalid tokens. Silently dropping
@@ -982,15 +1010,15 @@
                     + 'Comma-separated marker IDs (e.g. 0, 1, 5).'
                     + '</span>';
             }
-            return Promise.resolve();
+            return Promise.resolve(null);
         }
         body.vertices = z.vertices;
-        return fetch('/api/zones/' + idx, {
+        return zoneWrite(fetch('/api/zones/' + idx, {
             method: 'PUT',
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify(body),
-        }).then(function(r) {
-            if (!r.ok) return r;
+        }), detailsEl.querySelector('.actions')).then(function(r) {
+            if (!r) return r;
             // Persisted: clear the section's dirty flag so the
             // "Save as template" button re-enables. The per-vertex
             // input listener that fired during the edit set
@@ -1020,11 +1048,11 @@
             enabled: true,
             vertices: vertices,
         };
-        fetch('/api/zones', {
+        zoneWrite(fetch('/api/zones', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify(body),
-        }).then(function(r) { return r.ok ? r.json() : null; })
+        })).then(function(r) { return r ? r.json() : null; })
           .then(function(data) {
               if (data && typeof data.index === 'number') state.selectedIndex = data.index;
               fetchZones();
@@ -1034,20 +1062,20 @@
     function updateZoneVertices(idx) {
         var z = state.zones[idx];
         if (!z) return;
-        fetch('/api/zones/' + idx, {
+        zoneWrite(fetch('/api/zones/' + idx, {
             method: 'PUT',
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({vertices: z.vertices}),
-        });
+        }));
     }
 
     function deleteSelected() {
         if (state.selectedIndex < 0) return;
         if (!confirm('Delete this zone?')) return;
         var idx = state.selectedIndex;
-        fetch('/api/zones/' + idx, {method: 'DELETE'})
+        zoneWrite(fetch('/api/zones/' + idx, {method: 'DELETE'}))
             .then(function(r) {
-                if (r.ok) {
+                if (r) {
                     state.selectedIndex = -1;
                     fetchZones();
                 }

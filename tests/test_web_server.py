@@ -11,6 +11,7 @@ re-reads the saved file to confirm persistence.
 from __future__ import annotations
 
 import html
+import io
 import json
 import os
 import re
@@ -19,6 +20,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import wsgiref.util
 
 import pytest
 
@@ -6029,6 +6031,179 @@ def test_csrf_safe_method_ignores_foreign_origin(pin_protected_server) -> None:
         base, "/api/config", extra_headers={"Origin": "http://evil.example.com"}, method="GET", data=None
     )
     assert status != 403
+
+
+# ---------------------------------------------------------------------------
+# A change made through a name the station does not accept
+# ---------------------------------------------------------------------------
+
+_REFUSED_ORIGIN = "http://station.example.com"
+_REFUSED_SENTENCE = "This station does not accept changes made through station.example.com."
+
+
+def _raw_request(base, path, *, headers, method="POST", data=b""):
+    req = urllib.request.Request(
+        f"{base}{path}", data=None if method == "GET" else data, headers=headers, method=method
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return r.status, r.read().decode(), dict(r.headers.items())
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode(), dict(e.headers.items())
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {"HX-Request": "true", "Sec-Fetch-Mode": "navigate", "Accept": "text/html"},
+        {"Sec-Fetch-Mode": "cors", "Accept": "text/html"},
+        {"Accept": "*/*"},
+    ],
+    ids=["htmx", "fetch", "no-fetch-metadata"],
+)
+def test_a_scripted_change_through_an_unaccepted_name_is_refused_with_the_reason(live_server, headers) -> None:
+    server, base = live_server
+    status, body, response_headers = _raw_request(base, "/api/restart", headers={"Origin": _REFUSED_ORIGIN, **headers})
+    assert status == 403
+    assert response_headers["Content-Type"].startswith("application/json")
+    # The test server is reached over loopback, which is no address to offer a browser.
+    assert json.loads(body) == {"error": _REFUSED_SENTENCE, "action": "Open it by its IP address.", "href": None}
+    assert server.check_restart_requested() is False
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [{"Sec-Fetch-Mode": "navigate", "Accept": "text/html"}, {"Accept": "text/html,application/xhtml+xml"}],
+    ids=["fetch-metadata", "accept-only"],
+)
+def test_a_plain_form_post_through_an_unaccepted_name_gets_a_page_saying_why(live_server, headers) -> None:
+    _, base = live_server
+    status, body, response_headers = _raw_request(base, "/logout", headers={"Origin": _REFUSED_ORIGIN, **headers})
+    assert status == 403
+    assert response_headers["Content-Type"].startswith("text/html")
+    assert _REFUSED_SENTENCE in body
+    assert "Settings here can be viewed but not saved." in body
+    assert "<h2>Not saved</h2>" in body
+
+
+def test_a_refused_unlock_says_why_on_the_login_page(pin_protected_server) -> None:
+    _, base, pin = pin_protected_server
+    status, body, response_headers = _raw_request(
+        base,
+        "/login",
+        headers={
+            "Origin": _REFUSED_ORIGIN,
+            "Sec-Fetch-Mode": "navigate",
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+        data=urllib.parse.urlencode({"pin": pin}).encode(),
+    )
+    assert status == 403
+    assert f"Not logged in. {_REFUSED_SENTENCE}" in body
+    assert "You can&#039;t log in or save here." in body
+    assert "Set-Cookie" not in response_headers
+
+
+def _refused_login_post(tmp_path, declared_length: int | str, body: bytes) -> tuple[str, io.BytesIO]:
+    """POST the login form through a refused name straight into the WSGI app."""
+    server = ConfigWebServer(config_path=str(tmp_path / "config.toml"))
+    stream = io.BytesIO(body)
+    environ: dict[str, object] = {}
+    wsgiref.util.setup_testing_defaults(environ)
+    environ.update(
+        {
+            "REQUEST_METHOD": "POST",
+            "PATH_INFO": "/login",
+            "CONTENT_TYPE": "application/x-www-form-urlencoded",
+            "CONTENT_LENGTH": str(declared_length),
+            "HTTP_ORIGIN": _REFUSED_ORIGIN,
+            "HTTP_SEC_FETCH_MODE": "navigate",
+            "SERVER_ADDR": "192.0.2.10",
+            "wsgi.input": stream,
+        }
+    )
+    status: list[str] = []
+    b"".join(server._app(environ, lambda s, _headers, _exc=None: status.append(s)))
+    return status[0], stream
+
+
+def test_a_refusal_reads_the_body_first_so_closing_does_not_reset_its_answer(tmp_path) -> None:
+    # Closing a connection with unread request data resets it, which can drop
+    # the refusal before the browser reads it.
+    body = b"pin=sekret"
+    status, stream = _refused_login_post(tmp_path, len(body), body)
+    assert status.startswith("403")
+    assert stream.tell() == len(body)
+
+
+def test_a_refusal_does_not_read_a_body_past_the_pre_auth_cap(tmp_path) -> None:
+    status, stream = _refused_login_post(tmp_path, peer_auth.MAX_SIGNED_BODY_SIZE + 1, b"pin=sekret")
+    assert status.startswith("403")
+    assert stream.tell() == 0
+
+
+@pytest.mark.parametrize("declared", ["abc", "", "-5"])
+def test_a_refusal_with_a_missing_or_malformed_length_still_refuses(tmp_path, declared: str) -> None:
+    status, stream = _refused_login_post(tmp_path, declared, b"pin=sekret")
+    assert status.startswith("403")
+    assert stream.tell() == 0
+
+
+def test_the_refused_name_is_escaped(live_server) -> None:
+    _, base = live_server
+    status, body, _ = _raw_request(
+        base, "/logout", headers={"Origin": "http://a<b>.example", "Sec-Fetch-Mode": "navigate"}
+    )
+    assert status == 403
+    assert "made through a&lt;b&gt;.example." in body
+    assert "a<b>.example" not in body
+
+
+@pytest.mark.parametrize("path", ["/", "/wizard", "/about"])
+def test_a_page_opened_through_an_unaccepted_name_warns_before_any_edit(live_server, path: str) -> None:
+    _, base = live_server
+    port = base.rsplit(":", 1)[1]
+    status, body, _ = _raw_request(base, path, method="GET", headers={"Host": f"station.example.com:{port}"})
+    assert status == 200
+    assert _REFUSED_SENTENCE in body
+    assert "Settings here can be viewed but not saved." in body
+
+
+@pytest.mark.parametrize("path", ["/", "/wizard", "/about"])
+def test_a_page_opened_by_its_address_carries_no_warning(live_server, path: str) -> None:
+    _, base = live_server
+    status, body = _get(base, path)
+    assert status == 200
+    assert "does not accept changes made through" not in body
+
+
+def test_the_login_page_warns_before_the_pin_is_typed(pin_protected_server) -> None:
+    _, base, _ = pin_protected_server
+    port = base.rsplit(":", 1)[1]
+    status, body, _ = _raw_request(base, "/login", method="GET", headers={"Host": f"station.example.com:{port}"})
+    assert status == 200
+    assert _REFUSED_SENTENCE in body
+    assert "You can&#039;t log in or save here." in body
+
+
+def test_an_incorrect_pin_still_says_so(pin_protected_server) -> None:
+    _, base, _ = pin_protected_server
+    status, body = _post_form(base, "/login", {"pin": "wrong"})
+    assert status == 200
+    assert "Incorrect PIN" in body
+
+
+def test_every_page_loads_the_failed_save_script(live_server) -> None:
+    _, base = live_server
+    _, page = _get(base, "/")
+    assert '<script src="/assets/js/save-feedback.js?v=' in page
+    req = urllib.request.Request(f"{base}/assets/js/save-feedback.js")
+    with urllib.request.urlopen(req, timeout=5) as r:
+        assert "javascript" in r.headers["Content-Type"]
+        script = r.read().decode()
+    # Every non-GET HTMX request reports a refusal and a request that got no answer.
+    for hook in ("htmx:responseError", "htmx:sendError", "window.OpenFollow.saveError"):
+        assert hook in script
 
 
 # ---------------------------------------------------------------------------

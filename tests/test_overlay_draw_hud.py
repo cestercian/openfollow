@@ -65,8 +65,11 @@ from openfollow.runtime.overlay_draw_style import (
     COLOR_ACCENT,
     COLOR_ACCENT_SOFT,
     COLOR_BG_BASE,
-    COLOR_DANGER_BG,
-    COLOR_DANGER_TEXT,
+    COLOR_OK,
+    COLOR_TEXT,
+    COLOR_TEXT_MUTED,
+    COLOR_WARNING_BORDER,
+    COLOR_WARNING_FILL,
 )
 from openfollow.runtime.overlay_links import LINKS
 from openfollow.runtime.overlay_state import (
@@ -170,6 +173,20 @@ class TestModalScrim:
 
 class TestAboutScreen:
     """The on-screen About screen renders the AGPLv3 notice using pure Cairo text."""
+
+    def test_about_safety_line_is_off_white_in_two_even_lines(self) -> None:
+        cr = FakeCairo()
+        draw_about_screen(FakeRenderer(), cr, OverlayState(), 1920, 1080)
+        start = next(i for i, d in enumerate(cr.texts) if d.text.startswith("OpenFollow is intended"))
+        first, second = cr.texts[start], cr.texts[start + 1]
+        assert second.text.endswith("safety critical applications.")
+        assert all(d.rgba == (*COLOR_TEXT, 1.0) and d.bold for d in (first, second))
+        # Even: the two lines differ by less than one word, not a greedy full line plus a remainder.
+        widths = [cr.text_extents(d.text).width for d in (first, second)]
+        longest_word = max(cr.text_extents(w).width for w in (first.text + " " + second.text).split())
+        assert abs(widths[0] - widths[1]) <= longest_word
+        # No sign above it.
+        assert ("rgb", *COLOR_BG_BASE) not in cr.calls
 
     def test_about_screen_renders_name_version_and_notice(self) -> None:
         from openfollow import __version__
@@ -996,8 +1013,6 @@ class TestBottomLeftInfoPanel:
 
     def test_panel_turns_red_when_settings_banner_set(self) -> None:
         """The bottom-left HUD info panel mirrors the Settings menu's error state so operators see the failure."""
-        from openfollow.runtime.overlay_draw_style import COLOR_DANGER
-
         state = _base_state(ip_text="192.168.1.2")
         state.video_source_type = "rtsp"
         state.settings_menu_banner = "Video source unreachable."
@@ -1009,17 +1024,15 @@ class TestBottomLeftInfoPanel:
             1920,
             1080,
         )
-        # At least one stroke ran (the red border) AND the value
-        # colour was set to COLOR_DANGER for the IP / source rows.
-        assert cr.strokes >= 1
-        assert any(call[0] == "rgb" and call[1:] == COLOR_DANGER for call in cr.calls)
+        assert ("rgba", *COLOR_WARNING_FILL) in cr.calls
+        assert ("rgb", *COLOR_WARNING_BORDER) in cr.calls
+        # The values keep the HUD's normal text colour; the panel carries the red.
+        assert cr.find_texts("192.168.1.2")[0].rgba[:3] == COLOR_TEXT
 
     def test_panel_turns_red_when_error_message_set(self) -> None:
         """Same red treatment when ``state.error_message`` is set
         (mid-stream disconnect path that doesn't go through the
         auto-banner)."""
-        from openfollow.runtime.overlay_draw_style import COLOR_DANGER
-
         state = _base_state(ip_text="192.168.1.2")
         state.error_message = "Connection refused"
         cr = FakeCairo()
@@ -1030,15 +1043,13 @@ class TestBottomLeftInfoPanel:
             1920,
             1080,
         )
-        assert cr.strokes >= 1
-        assert any(call[0] == "rgb" and call[1:] == COLOR_DANGER for call in cr.calls)
+        assert ("rgba", *COLOR_WARNING_FILL) in cr.calls
+        assert ("rgb", *COLOR_WARNING_BORDER) in cr.calls
 
     def test_panel_stays_normal_when_no_error(self) -> None:
         """Default state: no banner, no error_message → panel uses the
         standard background gradient and values in normal text colour
         (no danger-red anywhere in the draw calls)."""
-        from openfollow.runtime.overlay_draw_style import COLOR_DANGER
-
         state = _base_state(ip_text="192.168.1.2")
         state.video_source_type = "ndi"
         state.settings_menu_banner = ""
@@ -1051,9 +1062,8 @@ class TestBottomLeftInfoPanel:
             1920,
             1080,
         )
-        # No danger-coloured fill / border / text in normal state.
-        assert not any(call[0] == "rgb" and call[1:] == COLOR_DANGER for call in cr.calls)
-        assert not any(call[0] == "rgba" and call[1:4] == COLOR_DANGER for call in cr.calls)
+        assert ("rgba", *COLOR_WARNING_FILL) not in cr.calls
+        assert ("rgb", *COLOR_WARNING_BORDER) not in cr.calls
 
 
 # --------------------------------------------------------------------------- #
@@ -1124,13 +1134,11 @@ class TestSystemStatsAndPanels:
     def test_info_panel_error_state_keeps_danger_chrome(self) -> None:
         # The failure state is a deliberate red alert and must NOT be
         # flattened into the neutral card chrome.
-        from openfollow.runtime.overlay_draw_style import COLOR_DANGER
-
         state = _base_state(ip_text="10.0.0.5", error_message="SRT connection lost")
         cr = FakeCairo()
         draw_bottom_left_info_panel(FakeRenderer(state=state), cr, state, 1920, 1080)
         assert not _emits_card_chrome(cr)
-        assert ("rgb", *COLOR_DANGER) in cr.calls
+        assert ("rgb", *COLOR_WARNING_BORDER) in cr.calls
 
     def test_help_panel_uses_card_chrome(self) -> None:
         # Top-left help block panel reads in the card style.
@@ -1282,13 +1290,13 @@ class TestMarkerCard:
         )
         sel_widths = [c[1] for c in cr_sel.calls if c[0] == "line_width"]
         unsel_widths = [c[1] for c in cr_unsel.calls if c[0] == "line_width"]
-        # Bumped 1px thicker than the original 1.5/1.8 – the chrome
-        # reads better at typical operator viewing distance, and the
-        # selection delta (selected = unselected + 0.3) is preserved.
-        assert 2.8 in sel_widths
-        assert 2.5 in unsel_widths
+        # The selection delta (selected = unselected + 0.5) is what tells them apart.
+        assert 4.0 in sel_widths
+        assert 3.5 in unsel_widths
 
-    def test_offline_marker_uses_danger_color_for_dot(self) -> None:
+    def test_an_offline_marker_shows_a_crossed_disc(self) -> None:
+        """An off-white disc with a cross cut into it in the card's dark
+        background, drawn in a saved state so its line width stays local."""
         state = _base_state()
         cr = FakeCairo()
         draw_marker_card(
@@ -1302,9 +1310,11 @@ class TestMarkerCard:
             selected=False,
             state=state,
         )
-        # DANGER color is #ff8c8c ≈ (1.0, 0.549, 0.549).
-        danger_set = [c for c in cr.calls if c[0] == "rgb" and c[1:] == (1.0, 0.549, 0.549)]
-        assert danger_set
+        disc = cr.calls.index(("rgb", *COLOR_TEXT))
+        cross = cr.calls.index(("rgb", *COLOR_BG_BASE), disc)
+        assert cr.calls[disc + 1][0] == "arc"
+        assert [c[0] for c in cr.calls[cross:]].count("line_to") >= 2
+        assert cr.saves == cr.restores >= 1
 
     def test_online_marker_draws_extra_glow_ring(self) -> None:
         """An online marker renders a second stroked arc around the dot."""
@@ -1457,13 +1467,27 @@ class TestMarkerCardRendering:
             selected=False,
             state=None,
         )
-        # The marker-colour stroke is the first rgba with alpha 0.62 (unselected).
-        marker_color_strokes = [
-            c
-            for c in cr.calls
-            if c[0] == "rgba" and c[1:3] == (1.0, 0.0) and c[3] == 0.0 and c[4] == pytest.approx(0.62)
-        ]
-        assert marker_color_strokes
+        # Solid marker colour, so the video and the card fill cannot tint it.
+        assert ("rgb", 1.0, 0.0, 0.0) in cr.calls
+        assert not any(c[0] == "rgba" and c[1:4] == (1.0, 0.0, 0.0) for c in cr.calls)
+
+    @pytest.mark.parametrize("selected", [True, False])
+    def test_the_online_dot_clears_the_border_by_2px(self, selected: bool) -> None:
+        def card(sel: bool) -> FakeCairo:
+            cr = FakeCairo()
+            draw_marker_card(FakeRenderer(), cr, x=x, y=y, w=w, h=64, t=_marker(online=True), selected=sel, state=None)
+            return cr
+
+        x, y, w = 100.0, 50.0, 180.0
+        # The dot never moves with selection, so it clears the selected (widest) border.
+        border_w = next(c[1] for c in card(True).calls if c[0] == "line_width")
+        cr = card(selected)
+        ring = next(i for i, c in enumerate(cr.calls) if c[0] == "arc" and c[3] == 6.0 and c[5] - c[4] > 6)
+        ring_w = next(c[1] for c in reversed(cr.calls[:ring]) if c[0] == "line_width")
+        _, cx, cy, r, *_ = cr.calls[ring]
+        outer = r + ring_w / 2
+        assert (x + w) - cx - outer - border_w / 2 >= 2.0
+        assert cy - y - outer - border_w / 2 >= 2.0
 
     def test_body_fill_uses_solid_color_not_gradient(self) -> None:
         """The body fill flattened from LinearGradient to a solid COLOR_BG_BASE."""
@@ -1518,9 +1542,10 @@ class TestMarkerCardRendering:
             state=None,
         )
         # 1-based: controller_idx 1 -> "C2".
-        assert "C2 missing" in cr.show_text_strings()
-        assert ("rgb", *COLOR_DANGER_BG) in cr.calls
+        assert ("rgba", *COLOR_WARNING_FILL) in cr.calls
         assert ("rgb", *COLOR_BG_BASE) not in cr.calls
+        badge = next(d for d in cr.texts if d.text == "C2 missing")
+        assert badge.rgba[:3] == COLOR_TEXT
 
     @staticmethod
     def _missing_card(name: str) -> tuple[FakeCairo, Any, Any]:
@@ -1571,7 +1596,7 @@ class TestMarkerCardRendering:
             selected=False,
             state=None,
         )
-        assert ("rgb", *COLOR_DANGER_BG) not in cr.calls
+        assert ("rgba", *COLOR_WARNING_FILL) not in cr.calls
         assert not any(text.endswith("missing") for text in cr.show_text_strings())
 
     def test_an_unbound_card_is_never_red(self) -> None:
@@ -1587,7 +1612,7 @@ class TestMarkerCardRendering:
             selected=False,
             state=None,
         )
-        assert ("rgb", *COLOR_DANGER_BG) not in cr.calls
+        assert ("rgba", *COLOR_WARNING_FILL) not in cr.calls
 
     @pytest.mark.parametrize("flash", [True, False])
     def test_identify_flashes_the_card(self, flash: bool) -> None:
@@ -1805,6 +1830,34 @@ class TestButtonDetectionOverlay:
         cr = FakeCairo()
         draw_button_detection_overlay(FakeRenderer(state=state), cr, state, 1600, 900)
         assert "Detection Complete!" in cr.show_text_strings()
+
+    def test_detection_complete_is_green_and_led_by_the_check_sign(self) -> None:
+        bd = ButtonDetectionState(active=True, current_label="", step=4, total_steps=4)
+        state = _base_state(button_detection=bd)
+        cr = FakeCairo()
+        draw_button_detection_overlay(FakeRenderer(state=state), cr, state, 1600, 900)
+        done = next(d for d in cr.texts if d.text == "Detection Complete!")
+        assert done.rgba == (*COLOR_OK, 1.0)
+        # The sign: a green disc left of the text, its check cut out in the panel colour.
+        disc = next(a for a in cr.calls if a[0] == "arc" and a[3] == 20.0 * 0.45)
+        assert disc[1] < done.x
+        assert ("rgb", *COLOR_BG_BASE) in cr.calls
+
+    def test_a_step_in_progress_counts_from_one(self) -> None:
+        bd = ButtonDetectionState(active=True, current_label="B", step=1, total_steps=4)
+        state = _base_state(button_detection=bd)
+        cr = FakeCairo()
+        draw_button_detection_overlay(FakeRenderer(state=state), cr, state, 1600, 900)
+        assert "Step 2 of 4  \u2013  Press Esc to cancel" in cr.show_text_strings()
+
+    def test_a_finished_run_says_so_instead_of_a_step_past_the_end(self) -> None:
+        bd = ButtonDetectionState(active=True, current_label="", step=4, total_steps=4)
+        state = _base_state(button_detection=bd)
+        cr = FakeCairo()
+        draw_button_detection_overlay(FakeRenderer(state=state), cr, state, 1600, 900)
+        texts = cr.show_text_strings()
+        assert "All 4 steps done  \u2013  Press Esc to close" in texts
+        assert not any(t.startswith("Step 5") for t in texts)
 
     def test_low_height_shrinks_prompt_font(self) -> None:
         """`h < 720` switches the big prompt from font 42 to 32."""
@@ -2427,13 +2480,23 @@ class TestTheDeviceBoxMatchesTheBrowser:
         assert lead.bold is True
         assert action.font_size == lead.font_size
 
-    def test_both_use_the_web_failure_colour(self) -> None:
-        """``#ffd7d7``; the device drew body text in the ordinary near-white,
-        so the same failure looked like a different kind of message."""
+    def test_the_box_leads_with_the_warning_sign(self) -> None:
+        """The same sign as the status rows, with every text line beside it."""
         cr = self._draws()
-        for needle in ("Nothing answered", "Check the camera"):
-            rgba = self._find(cr, needle).rgba
-            assert rgba[:3] == pytest.approx(COLOR_DANGER_TEXT, abs=0.002)
+        kinds = [c[0] for c in cr.calls]
+        apex = next(c for c in cr.calls[kinds.index("line_join") :] if c[0] == "move_to")
+        label = self._find(cr, "ERROR")
+        assert label.x > apex[1] + 8
+        assert self._find(cr, "Nothing answered").x == label.x
+        assert self._find(cr, "Check the camera").x == label.x
+
+    def test_the_text_keeps_the_huds_own_colours(self) -> None:
+        """The box carries the red; its text reads like every other HUD text:
+        the observation in the normal colour, the label and next step muted."""
+        cr = self._draws()
+        assert self._find(cr, "Nothing answered").rgba[:3] == COLOR_TEXT
+        assert self._find(cr, "Check the camera").rgba == COLOR_TEXT_MUTED
+        assert self._find(cr, "ERROR").rgba == COLOR_TEXT_MUTED
 
     def test_the_source_is_named_once(self) -> None:
         """The sentence already carries the address; a headline above it

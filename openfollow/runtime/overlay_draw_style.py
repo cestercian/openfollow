@@ -7,6 +7,8 @@ from __future__ import annotations
 import math
 from typing import Any
 
+import cairo
+
 # ==================================================================
 # Color Palette (adapted from web UI)
 # ==================================================================
@@ -31,17 +33,25 @@ COLOR_BORDER = (1.0, 1.0, 1.0, 0.12)  # standard border (RGBA)
 CARD_BG_ALPHA = 0.9
 
 # Status indicators
-COLOR_OK = (0.494, 0.898, 0.624)  # #7de59f (RGB, green, online)
-COLOR_DANGER = (1.0, 0.549, 0.549)  # #ff8c8c (RGB, red, offline)
-# Text inside a failure box. Matches the web UI's ``.notice.error`` colour so
-# the same message reads the same on the screen and in the browser.
-COLOR_DANGER_TEXT = (1.0, 0.843, 0.843)  # #ffd7d7 (RGB)
-# Card background of a marker whose controller is missing; dark enough that the
-# card's light text stays readable on it.
+COLOR_OK = (0.361, 0.788, 0.549)  # #5cc98c (RGB, green, online)
+# The HUD's warning red. Status rows, failure panels and a missing controller's
+# card fill with it (the card keeps its marker-coloured border); dark enough
+# that the HUD's normal text stays readable on it.
 COLOR_DANGER_BG = (0.42, 0.08, 0.08)  # #6b1414 (RGB)
+COLOR_WARNING_FILL = (*COLOR_DANGER_BG, 0.8)  # #6b1414 at 80% (RGBA)
+COLOR_WARNING_BORDER = (0.69, 0.149, 0.149)  # #b02626 (RGB)
+COLOR_INFO_BG = (0.09, 0.239, 0.42)  # #173d6b (RGB)
+COLOR_INFO_FILL = (*COLOR_INFO_BG, 0.8)  # #173d6b at 80% (RGBA)
+COLOR_INFO_BORDER = (0.149, 0.392, 0.69)  # #2664b0 (RGB)
 
 # Typography
 FONT_UI_FAMILY = "Inter"
+
+
+# One corner radius per nesting level, so an inner corner is never rounder than its container.
+MODAL_RADIUS = 14.0
+PANEL_RADIUS = 6.0
+ROW_RADIUS = 4.0
 
 
 def draw_rounded_rect(cr: Any, x: float, y: float, w: float, h: float, radius: float) -> None:
@@ -64,7 +74,66 @@ def draw_rounded_rect(cr: Any, x: float, y: float, w: float, h: float, radius: f
     cr.close_path()
 
 
-def draw_card_background(cr: Any, x: float, y: float, w: float, h: float, radius: float = 10.0) -> None:
+def draw_warning_sign(cr: Any, cx: float, cy: float, size: float = 13.0) -> None:
+    """Off-white warning triangle with its "!" in the warning red, centred on (cx, cy)."""
+    half = size * 0.58
+    cr.save()
+    cr.set_line_join(cairo.LINE_JOIN_ROUND)
+    cr.set_line_width(size * 0.154)
+    cr.move_to(cx, cy - size * 0.55)
+    cr.line_to(cx - half, cy + size * 0.45)
+    cr.line_to(cx + half, cy + size * 0.45)
+    cr.close_path()
+    cr.set_source_rgb(*COLOR_TEXT)
+    cr.fill_preserve()
+    cr.stroke()
+    mark_h = size * 0.62
+    bar_w = mark_h * 0.2
+    bar_h = mark_h * 0.52
+    bar_top = cy + size * 0.092 - mark_h * 0.42
+    cr.set_source_rgb(*COLOR_DANGER_BG)
+    cr.rectangle(cx - bar_w / 2, bar_top, bar_w, bar_h)
+    cr.fill()
+    cr.arc(cx, bar_top + bar_h + bar_w * 1.25, bar_w * 0.62, 0, 2 * math.pi)
+    cr.fill()
+    cr.restore()
+
+
+def draw_info_sign(cr: Any, cx: float, cy: float, size: float = 13.0, cut: tuple[float, ...] = COLOR_BG_BASE) -> None:
+    """Off-white disc with its "i" cut out in ``cut``, centred on (cx, cy)."""
+    cr.save()
+    cr.set_source_rgb(*COLOR_TEXT)
+    cr.arc(cx, cy, size * 0.45, 0, 2 * math.pi)
+    cr.fill()
+    cr.set_source_rgb(*cut)
+    stem_w = size * 0.1125
+    cr.rectangle(cx - stem_w / 2, cy - size * 0.0875, stem_w, size * 0.325)
+    cr.fill()
+    cr.arc(cx, cy - size * 0.206, size * 0.069, 0, 2 * math.pi)
+    cr.fill()
+    cr.restore()
+
+
+def draw_success_sign(
+    cr: Any, cx: float, cy: float, size: float = 13.0, cut: tuple[float, ...] = COLOR_BG_BASE
+) -> None:
+    """Green disc with its check cut out in ``cut``, centred on (cx, cy)."""
+    cr.save()
+    cr.set_source_rgb(*COLOR_OK)
+    cr.arc(cx, cy, size * 0.45, 0, 2 * math.pi)
+    cr.fill()
+    cr.set_source_rgb(*cut)
+    cr.set_line_width(size * 0.1125)
+    cr.set_line_cap(cairo.LINE_CAP_ROUND)
+    cr.set_line_join(cairo.LINE_JOIN_ROUND)
+    cr.move_to(cx - size * 0.2125, cy + size * 0.01875)
+    cr.line_to(cx - size * 0.0625, cy + size * 0.1625)
+    cr.line_to(cx + size * 0.2125, cy - size * 0.1375)
+    cr.stroke()
+    cr.restore()
+
+
+def draw_card_background(cr: Any, x: float, y: float, w: float, h: float, radius: float = PANEL_RADIUS) -> None:
     """Translucent card fill + soft 1px border – the shared overlay-card chrome.
 
     Used by the operator-message cards and every HUD panel (help, bottom-left

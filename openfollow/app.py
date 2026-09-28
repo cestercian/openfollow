@@ -37,6 +37,9 @@ from openfollow.runtime.app_commands import (
     check_button_detection_request as runtime_check_button_detection_request,
 )
 from openfollow.runtime.app_commands import (
+    check_camera_setup_requests as runtime_check_camera_setup_requests,
+)
+from openfollow.runtime.app_commands import (
     check_controller_slot_actions as runtime_check_controller_slot_actions,
 )
 from openfollow.runtime.app_commands import (
@@ -527,6 +530,9 @@ class OpenFollowApp:
 
     def _check_controller_slot_actions(self) -> None:
         runtime_check_controller_slot_actions(self)
+
+    def _check_camera_setup_requests(self) -> None:
+        runtime_check_camera_setup_requests(self)
 
     def _run_deb_update(self, request: dict[str, str]) -> None:
         runtime_run_deb_update(self, request)

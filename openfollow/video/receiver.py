@@ -410,6 +410,23 @@ class GstNativeSinkReceiver:
         self._bus_handler.teardown_bus(pipeline)
         self._pipeline = None
 
+    def release_source(self) -> None:
+        """Stop the pipeline so its device can be removed; ``swap_input`` builds it again.
+
+        A device that vanishes under a running pipeline leaves it unable to
+        reach NULL. Raises ``PipelineStuckError`` when this one does not.
+        Only runs on GTK main thread.
+        """
+        self._cancel_connection_timeout()
+        self._cancel_reconnect()
+        self._cancel_heal()
+        self._cancel_watchdog()
+        self._cancel_discovery()
+        self._stop_discovery_thread("release_source")
+        self._null_transition_current_pipeline(swap_label="release_source")
+        self._reset_video_flow_state()
+        self._status_marker.set_disconnected()
+
     def swap_input(
         self,
         source_type: str,
@@ -436,18 +453,7 @@ class GstNativeSinkReceiver:
         self._cancel_heal()
         self._cancel_watchdog()
         self._cancel_discovery()
-        if self._discovery_thread is not None:
-            discovery_thread = self._discovery_thread
-            discovery_thread.join(timeout=3.0)
-            if discovery_thread.is_alive():
-                error_message = (
-                    "swap_input: prior discovery thread did not stop "
-                    "within 3 s – refusing to rebuild input state "
-                    "while discovery may still be running"
-                )
-                self._status_marker.set_disconnected(error_message)
-                raise PipelineStuckError(error_message)
-            self._discovery_thread = None
+        self._stop_discovery_thread("swap_input")
         self._null_transition_current_pipeline(swap_label="swap_input")
         self._reset_video_flow_state()
         self._state.forget_video_history()
@@ -1309,6 +1315,25 @@ class GstNativeSinkReceiver:
         interval = self._input_caps.discovery_interval
         delay_ms = int(interval * 1000)
         self._discovery_source_id = GLib.timeout_add(delay_ms, self._do_discovery)
+
+    def _stop_discovery_thread(self, caller: str) -> None:
+        """Wait for a running discovery; ``PipelineStuckError`` if it outlives 3 s.
+
+        ``_cancel_discovery`` only removes the timer, so a pass already inside
+        ``discover_sources`` would otherwise keep using the source.
+        """
+        discovery_thread = self._discovery_thread
+        if discovery_thread is None:
+            return
+        discovery_thread.join(timeout=3.0)
+        if discovery_thread.is_alive():
+            error_message = (
+                f"{caller}: prior discovery thread did not stop within 3 s – "
+                "refusing to go on while discovery may still be using the source"
+            )
+            self._status_marker.set_disconnected(error_message)
+            raise PipelineStuckError(error_message)
+        self._discovery_thread = None
 
     def _cancel_discovery(self) -> None:
         if self._discovery_source_id is not None:

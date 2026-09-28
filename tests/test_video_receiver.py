@@ -3699,6 +3699,113 @@ class TestSwapInput:
         assert "FakeAlt" in r._status_marker.error_message
 
 
+class TestReleaseSource:
+    """Stopping the pipeline so its device can be removed, then building it again."""
+
+    def _armed(self, fake_glib) -> Any:  # noqa: ANN001
+        """A receiver streaming, with every timer that could rebuild or poke its pipeline pending."""
+        r = _make_receiver(input_config={"fake_source": "cam-1"})
+        r._pipeline = FakePipeline()
+        r._state.set_resolution(1920, 1080)
+        r._state.connection_timeout_id = fake_glib.timeout_add(1000, lambda: False)
+        r._state.reconnect_source_id = fake_glib.timeout_add(1000, lambda: False)
+        r._heal_source_id = fake_glib.timeout_add(1000, lambda: False)
+        r._watchdog_source_id = fake_glib.timeout_add(1000, lambda: False)
+        r._discovery_source_id = fake_glib.timeout_add(1000, lambda: False)
+        return r
+
+    def test_the_pipeline_reaches_null_and_nothing_restarts_it(
+        self, fake_gst, fake_glib, fake_input_pair, monkeypatch
+    ) -> None:
+        r = self._armed(fake_glib)
+        pipeline = r._pipeline
+        monkeypatch.setattr(threading, "Thread", _SyncSwapThread)
+
+        r.release_source()
+
+        assert FakeState.NULL in pipeline.state_changes
+        assert r._pipeline is None
+        # A timer left pending would start the source again while its device is going away.
+        assert fake_glib.timers == {}
+        assert r.resolution == (0, 0)
+        assert r.connected is False
+
+    def test_swap_input_builds_it_again(self, fake_gst, fake_glib, fake_input_pair, monkeypatch) -> None:
+        r = self._armed(fake_glib)
+        monkeypatch.setattr(threading, "Thread", _SyncSwapThread)
+        new_pipeline = FakePipeline()
+        FakeInput.create_pipeline_result = new_pipeline
+
+        r.release_source()
+        r.swap_input("fake", {"fake_source": "cam-1"})
+
+        assert r._pipeline is new_pipeline
+
+    def test_a_pipeline_that_does_not_stop_raises(self, fake_gst, fake_glib, fake_input_pair, monkeypatch) -> None:
+        from openfollow.video.receiver import PipelineStuckError
+
+        class StuckThread(_SyncSwapThread):
+            def start(self) -> None:
+                pass
+
+            def is_alive(self) -> bool:
+                return True
+
+        r = self._armed(fake_glib)
+        pipeline = r._pipeline
+        monkeypatch.setattr(threading, "Thread", StuckThread)
+
+        with pytest.raises(PipelineStuckError, match="release_source: prior pipeline did not reach NULL"):
+            r.release_source()
+        assert r._pipeline is pipeline  # kept, so the next swap re-enters the guard
+
+    def test_a_running_discovery_finishes_before_the_pipeline_stops(
+        self, fake_gst, fake_glib, fake_input_pair, monkeypatch
+    ) -> None:
+        r = self._armed(fake_glib)
+        pipeline = r._pipeline
+        joins: list[tuple[float | None, bool]] = []
+
+        class FinishingDiscovery:
+            def join(self, timeout: float | None = None) -> None:
+                joins.append((timeout, FakeState.NULL in pipeline.state_changes))
+
+            def is_alive(self) -> bool:
+                return False
+
+        r._discovery_thread = FinishingDiscovery()  # type: ignore[assignment]
+        monkeypatch.setattr(threading, "Thread", _SyncSwapThread)
+
+        r.release_source()
+
+        # Joined once, before the pipeline was told to stop.
+        assert joins == [(3.0, False)]
+        assert FakeState.NULL in pipeline.state_changes
+        assert r._discovery_thread is None
+
+    def test_a_discovery_that_does_not_stop_raises_and_keeps_the_pipeline(
+        self, fake_gst, fake_glib, fake_input_pair, monkeypatch
+    ) -> None:
+        from openfollow.video.receiver import PipelineStuckError
+
+        class StuckDiscovery:
+            def join(self, timeout: float | None = None) -> None:
+                return None
+
+            def is_alive(self) -> bool:
+                return True
+
+        r = self._armed(fake_glib)
+        pipeline = r._pipeline
+        r._discovery_thread = StuckDiscovery()  # type: ignore[assignment]
+
+        with pytest.raises(PipelineStuckError, match="release_source: prior discovery thread did not stop"):
+            r.release_source()
+        assert r._pipeline is pipeline
+        assert FakeState.NULL not in pipeline.state_changes
+        assert r._discovery_thread is not None
+
+
 # --------------------------------------------------------------------------- #
 # swap_detection_branch – (live detector pipeline rebuild)
 # --------------------------------------------------------------------------- #

@@ -182,6 +182,24 @@ _AUTOSTART_NOT_APPLIED = "The station accepted the change but did not apply it."
 _AUTOSTART_CHANGE_FAILED = "The setting could not be changed."
 
 
+_NO_BROKER = "Elevated actions are not available on this build."
+_CAMERA_RELEASE_TIMEOUT_S = 5.0
+
+
+def _camera_setup_view(state: Any) -> dict[str, Any]:
+    """A :class:`CameraSetupState` as the plain dict the web layer renders."""
+    return {
+        "available": state.available,
+        "reason": state.reason,
+        "sensors": list(state.sensors),
+        "configured": state.configured.token() if state.configured is not None else "",
+        "managed": state.managed,
+        "active": [camera.token() for camera in state.active],
+        "live": state.live.token() if state.live is not None else "",
+        "pending": state.pending,
+    }
+
+
 def _autostart_failure_text(exc: Exception) -> str:
     """Operator-facing sentence for a failed autostart change.
 
@@ -214,6 +232,11 @@ class WebCommandQueue:
         # loop, which owns the slots.
         self._slot_actions_lock = threading.Lock()
         self._slot_actions: list[tuple[str, int, str]] = []
+        # The web camera setup changes a Pi camera live: the main loop stops the
+        # Pi Camera pipeline before an overlay is unloaded, and rebuilds it after.
+        self._camera_release_requested = threading.Event()
+        self._camera_released = threading.Event()
+        self._video_rebuild_requested = threading.Event()
         self._update_lock = threading.Lock()
         self._update_request: dict[str, str] | None = None
         self._update_status: dict[str, str] = {
@@ -289,6 +312,36 @@ class WebCommandQueue:
         with self._slot_actions_lock:
             actions, self._slot_actions = self._slot_actions, []
         return actions
+
+    def release_camera(self, timeout: float) -> bool:
+        """Web thread: have the main loop stop the Pi Camera pipeline; ``True`` once it has.
+
+        A rebuild an earlier change left pending is dropped: served in the same
+        pass as this release, it would restart the camera this change is about
+        to unload. The change asking for the release requests its own rebuild.
+        """
+        self._video_rebuild_requested.clear()
+        self._camera_released.clear()
+        self._camera_release_requested.set()
+        return self._camera_released.wait(timeout)
+
+    def consume_camera_release_requested(self) -> bool:
+        if self._camera_release_requested.is_set():
+            self._camera_release_requested.clear()
+            return True
+        return False
+
+    def confirm_camera_released(self) -> None:
+        self._camera_released.set()
+
+    def request_video_rebuild(self) -> None:
+        self._video_rebuild_requested.set()
+
+    def consume_video_rebuild_requested(self) -> bool:
+        if self._video_rebuild_requested.is_set():
+            self._video_rebuild_requested.clear()
+            return True
+        return False
 
     def consume_button_detection_requested(self) -> bool:
         if self._button_detection_requested.is_set():
@@ -572,6 +625,7 @@ class AppRuntimeServices:
         self._app = app
         self._shutdown_in_progress = False
         self._is_pi = self._is_raspberry_pi()
+        self._camera_setup_lock = threading.Lock()
         # Central registry of input-binding ownership, pre-populated with
         # the movement-key reservations under owner "system:movement".
         from openfollow.configuration import RESERVED_MOVEMENT_KEYS
@@ -2022,6 +2076,10 @@ class AppRuntimeServices:
             # Boot-autostart switch: host state on read, broker-elevated write.
             autostart_state_provider=self._autostart_state_provider,
             autostart_apply_handler=self._handle_autostart_apply,
+            # Pi camera setup: config.txt read as itself, changed through the broker.
+            camera_setup_state_provider=self._camera_setup_state_provider,
+            camera_setup_apply_handler=self._handle_camera_setup_apply,
+            camera_setup_restart_handler=self._handle_camera_setup_restart,
             marker_catalog_provider=lambda: self._app._marker_catalog,
             marker_catalog_sync_provider=lambda: self._app._marker_catalog_sync,
             # Live gamepad snapshot for the diagnostics bundle's E9 section.
@@ -2309,6 +2367,64 @@ class AppRuntimeServices:
         if broker is None:
             return {}
         return {name: state.value for name, state in broker.states().items()}
+
+    def _camera_setup_state_provider(self) -> dict[str, Any]:
+        """Web provider: the Pi camera the boot configuration names, and the cameras libcamera sees."""
+        from openfollow.privilege.camera_config import read_camera_setup
+        from openfollow.video.inputs.picam import discover_cameras
+
+        return {**_camera_setup_view(read_camera_setup()), "detected": discover_cameras()}
+
+    def _handle_camera_setup_apply(self, token: str) -> dict[str, Any]:
+        """Web write path: name the camera in config.txt and start it now where possible."""
+        from openfollow.privilege.broker import PrivilegeError
+        from openfollow.privilege.camera_config import parse_token, read_camera_setup
+        from openfollow.privilege.camera_setup import apply_camera
+
+        broker = getattr(self, "_privilege_broker", None)
+        if broker is None:
+            return {"ok": False, "error": _NO_BROKER, **_camera_setup_view(read_camera_setup())}
+        try:
+            choice = parse_token(token)
+        except ValueError:
+            return {
+                "ok": False,
+                "error": "That is not a camera this station offers.",
+                **_camera_setup_view(read_camera_setup()),
+            }
+        web_commands = self._app._web_commands
+        released = False
+
+        def _release() -> bool:
+            nonlocal released
+            released = True
+            return bool(web_commands.release_camera(_CAMERA_RELEASE_TIMEOUT_S))
+
+        # One change at a time: two interleaved would each unload what the other loaded.
+        with self._camera_setup_lock:
+            try:
+                state, changed = apply_camera(broker, choice, release=_release)
+            except PrivilegeError as exc:
+                if released:
+                    web_commands.request_video_rebuild()
+                return {"ok": False, "error": _autostart_failure_text(exc), **_camera_setup_view(read_camera_setup())}
+            if changed or released:
+                web_commands.request_video_rebuild()
+        return {"ok": True, **_camera_setup_view(state)}
+
+    def _handle_camera_setup_restart(self) -> dict[str, Any]:
+        """Web write path: reboot so a camera change that could not be made live applies."""
+        from openfollow.privilege.broker import PrivilegeError
+        from openfollow.privilege.camera_setup import restart_station
+
+        broker = getattr(self, "_privilege_broker", None)
+        if broker is None:
+            return {"ok": False, "error": _NO_BROKER}
+        try:
+            restart_station(broker)
+        except PrivilegeError as exc:
+            return {"ok": False, "error": _autostart_failure_text(exc)}
+        return {"ok": True}
 
     def _autostart_state_provider(self, service_name: str) -> dict[str, Any]:
         """Web provider: does ``service_name`` start at boot?

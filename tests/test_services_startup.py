@@ -859,3 +859,184 @@ def test_online_sync_status_provider_copies_the_health_mapping(monkeypatch) -> N
     handed_out = services._online_sync_status_provider()
     handed_out["online"] = True
     assert live == {"online": False}
+
+
+# Pi camera setup providers (Video Source -> Pi Camera -> Camera setup)
+
+
+def _camera_state(**kw):  # noqa: ANN003, ANN202
+    from openfollow.privilege.camera_config import CameraSetupState
+
+    return CameraSetupState(available=True, sensors=("imx708", "ov5647"), **kw)
+
+
+def _camera_services(monkeypatch):  # noqa: ANN001, ANN202
+    return _build_services_with_web_commands(monkeypatch, services_module.WebCommandQueue())
+
+
+def _stub_camera(monkeypatch, *, read=None, apply=None, restart=None) -> None:  # noqa: ANN001
+    import openfollow.privilege.camera_config as config_module
+    import openfollow.privilege.camera_setup as setup_module
+
+    if read is not None:
+        monkeypatch.setattr(config_module, "read_camera_setup", read)
+    if apply is not None:
+        monkeypatch.setattr(setup_module, "apply_camera", apply)
+    if restart is not None:
+        monkeypatch.setattr(setup_module, "restart_station", restart)
+
+
+def test_camera_setup_state_provider_flattens_the_host_read(monkeypatch) -> None:  # noqa: ANN001
+    from openfollow.privilege.camera_config import Camera
+
+    ov = Camera("ov5647", "cam0")
+    import openfollow.video.inputs.picam as picam_module
+
+    services = _camera_services(monkeypatch)
+    _stub_camera(monkeypatch, read=lambda: _camera_state(configured=ov, managed=True, active=(ov,), live=ov))
+    detected = [{"model": "ov5647", "path": "/base/ov5647@36"}]
+    monkeypatch.setattr(picam_module, "discover_cameras", lambda: detected)
+    assert services._camera_setup_state_provider() == {
+        "available": True,
+        "reason": "",
+        "sensors": ["imx708", "ov5647"],
+        "configured": "ov5647,cam0",
+        "managed": True,
+        "active": ["ov5647,cam0"],
+        "live": "ov5647,cam0",
+        "pending": False,
+        "detected": detected,
+    }
+
+
+@pytest.mark.parametrize("changed", [True, False])
+def test_camera_setup_apply_rebuilds_the_pipeline_only_after_a_live_change(monkeypatch, changed) -> None:  # noqa: ANN001
+    from openfollow.privilege.camera_config import Camera
+
+    services = _camera_services(monkeypatch)
+    seen: list[object] = []
+
+    def _apply(_broker, choice, release):  # noqa: ANN001, ANN202
+        seen.append(choice)
+        return _camera_state(configured=choice), changed
+
+    _stub_camera(monkeypatch, apply=_apply)
+    result = services._handle_camera_setup_apply("ov5647,cam0")
+    assert seen == [Camera("ov5647", "cam0")]
+    assert (result["ok"], result["configured"]) == (True, "ov5647,cam0")
+    assert services._app._web_commands.consume_video_rebuild_requested() is changed
+
+
+def test_camera_setup_apply_automatic_passes_none(monkeypatch) -> None:  # noqa: ANN001
+    services = _camera_services(monkeypatch)
+    seen: list[object] = []
+    _stub_camera(monkeypatch, apply=lambda _b, choice, release: (seen.append(choice) or _camera_state(), False))
+    assert services._handle_camera_setup_apply("automatic")["ok"] is True
+    assert seen == [None]
+
+
+def test_camera_setup_apply_refuses_a_token_that_is_no_camera(monkeypatch) -> None:  # noqa: ANN001
+    services = _camera_services(monkeypatch)
+    _stub_camera(monkeypatch, read=_camera_state, apply=lambda *_a, **_kw: pytest.fail("must not apply"))
+    result = services._handle_camera_setup_apply("../etc,cam0")
+    assert (result["ok"], result["error"], result["available"]) == (
+        False,
+        "That is not a camera this station offers.",
+        True,
+    )
+
+
+def test_camera_setup_apply_reports_a_refused_change(monkeypatch) -> None:  # noqa: ANN001
+    from openfollow.privilege.broker import PrivilegeError
+
+    def _refuse(*_a, **_kw):  # noqa: ANN002, ANN003, ANN202
+        raise PrivilegeError("Name the Pi camera in the boot configuration: This user is not in the sudoers file.")
+
+    services = _camera_services(monkeypatch)
+    _stub_camera(monkeypatch, read=_camera_state, apply=_refuse)
+    result = services._handle_camera_setup_apply("ov5647,cam0")
+    assert (result["ok"], result["error"]) == (False, "This user is not in the sudoers file.")
+    assert result["sensors"] == ["imx708", "ov5647"]  # re-read from the host
+    assert services._app._web_commands.consume_video_rebuild_requested() is False
+
+
+@pytest.mark.parametrize("refused", [False, True], ids=["applied", "unload-refused"])
+def test_camera_setup_rebuilds_after_every_release(monkeypatch, refused) -> None:  # noqa: ANN001
+    """A pipeline stopped for an unload is built again, whether or not the change went through."""
+    from openfollow.privilege.broker import PrivilegeError
+
+    monkeypatch.setattr(services_module, "_CAMERA_RELEASE_TIMEOUT_S", 0.01)  # no main loop answers here
+    services = _camera_services(monkeypatch)
+    answers: list[bool] = []
+
+    def _apply(_broker, _choice, release):  # noqa: ANN001, ANN202
+        answers.append(release())
+        if refused:
+            raise PrivilegeError("Stop the Pi camera started earlier: refused")
+        return _camera_state(pending=True), False
+
+    _stub_camera(monkeypatch, read=_camera_state, apply=_apply)
+    result = services._handle_camera_setup_apply("imx708,cam0")
+    assert answers == [False]  # unanswered: apply_camera leaves the camera loaded
+    assert result["ok"] is not refused
+    assert services._app._web_commands.consume_video_rebuild_requested() is True
+
+
+def test_camera_setup_applies_one_change_at_a_time(monkeypatch) -> None:  # noqa: ANN001
+    import threading
+
+    services = _camera_services(monkeypatch)
+    inside: list[str] = []
+    first_in = threading.Event()
+    let_first_finish = threading.Event()
+
+    def _apply(_broker, choice, release):  # noqa: ANN001, ANN202
+        inside.append(f"enter {choice.sensor}")
+        if choice.sensor == "ov5647":
+            first_in.set()
+            let_first_finish.wait(5)
+        inside.append(f"leave {choice.sensor}")
+        return _camera_state(), False
+
+    _stub_camera(monkeypatch, apply=_apply)
+    first = threading.Thread(target=services._handle_camera_setup_apply, args=("ov5647,cam0",))
+    first.start()
+    first_in.wait(5)
+    second = threading.Thread(target=services._handle_camera_setup_apply, args=("imx708,cam0",))
+    second.start()
+    second.join(timeout=0.2)
+    assert second.is_alive()  # held at the lock while the first change runs
+    let_first_finish.set()
+    first.join(5)
+    second.join(5)
+    assert inside == ["enter ov5647", "leave ov5647", "enter imx708", "leave imx708"]
+
+
+def test_camera_setup_without_a_broker(monkeypatch) -> None:  # noqa: ANN001
+    services = _camera_services(monkeypatch)
+    delattr(services, "_privilege_broker")
+    _stub_camera(monkeypatch, read=_camera_state)
+    assert (
+        services._handle_camera_setup_apply("ov5647,cam0")["error"]
+        == "Elevated actions are not available on this build."
+    )
+    assert services._handle_camera_setup_restart() == {
+        "ok": False,
+        "error": "Elevated actions are not available on this build.",
+    }
+
+
+def test_camera_setup_restart(monkeypatch) -> None:  # noqa: ANN001
+    from openfollow.privilege.broker import PrivilegeError
+
+    services = _camera_services(monkeypatch)
+    calls: list[object] = []
+    _stub_camera(monkeypatch, restart=calls.append)
+    assert services._handle_camera_setup_restart() == {"ok": True}
+    assert calls == [services._privilege_broker]
+
+    def _refuse(_broker):  # noqa: ANN001, ANN202
+        raise PrivilegeError("Restart the station: refused")
+
+    _stub_camera(monkeypatch, restart=_refuse)
+    assert services._handle_camera_setup_restart() == {"ok": False, "error": "refused"}

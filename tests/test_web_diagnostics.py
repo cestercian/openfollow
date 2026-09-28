@@ -3535,7 +3535,7 @@ def test_collect_runtime_state_lists_every_controller_slot() -> None:
                 "state": "missing",
                 "marker_id": 10,
                 "name": "GameSir",
-                "port_label": "USB 2 · port 1",
+                "port_label": "USB 2, port 1",
                 "port_key": "usb:platform/xhci-hcd.1:1",
             },
             {"controller_index": 1, "state": "connected", "marker_id": 11, "name": "", "port_label": ""},
@@ -3544,13 +3544,28 @@ def test_collect_runtime_state_lists_every_controller_slot() -> None:
     rows = diag.collect_runtime_state(diag.DiagnosticsProviders(runtime_stats=lambda: stats))
     joined = "\n".join(rows)
     assert "1 connected, 1 missing, 1 mapped to a marker" in joined
-    assert "    C1   missing   marker 10   GameSir (USB 2 · port 1)" in rows
+    assert "    C1   missing   marker 10   GameSir (USB 2, port 1)" in rows
     assert "    C2   connected marker 11   (unnamed) (no stable port)" in rows
     # The raw key follows a slot that has one, for support to match against sysfs.
-    first = rows.index("    C1   missing   marker 10   GameSir (USB 2 · port 1)")
+    first = rows.index("    C1   missing   marker 10   GameSir (USB 2, port 1)")
     assert rows[first + 1] == "         key usb:platform/xhci-hcd.1:1"
     second = rows.index("    C2   connected marker 11   (unnamed) (no stable port)")
     assert "key" not in rows[second + 1]
+
+
+def test_collect_runtime_state_names_what_each_controller_cannot_do() -> None:
+    stats = _stats()
+    stats["controllers"] = {
+        "items": [
+            {"controller_index": 0, "state": "connected", "name": "GameSir", "notes": ["cannot_identify"]},
+            {"controller_index": 1, "state": "connected", "name": "Xbox", "notes": []},
+        ],
+    }
+    rows = diag.collect_runtime_state(diag.DiagnosticsProviders(runtime_stats=lambda: stats))
+    first = next(i for i, row in enumerate(rows) if "GameSir" in row)
+    assert rows[first + 1] == "         notes cannot_identify"
+    second = next(i for i, row in enumerate(rows) if "Xbox" in row)
+    assert "notes" not in rows[second + 1]
 
 
 def test_collect_runtime_state_reports_not_wired() -> None:

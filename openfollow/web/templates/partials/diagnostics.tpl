@@ -44,6 +44,10 @@
             <a class="save-btn btn-link" href="/api/diagnostics/bundle" download>
                 Download diagnostics bundle
             </a>
+            %# Its dialog's steps live in ``base.tpl``, like Restart's confirm below.
+            <button type="button" class="secondary" onclick="openfollowSaveToDrive()">
+                Save to USB storage device
+            </button>
             <button type="button" class="secondary"
                     hx-post="/api/diagnostics/test-peers"
                     hx-target="#diagnostics-probe-results"

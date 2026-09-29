@@ -11,7 +11,7 @@ import subprocess
 import threading
 import time
 from collections.abc import Callable
-from typing import Final
+from typing import Final, cast
 
 from openfollow.privilege.capabilities import (
     Capability,
@@ -60,7 +60,16 @@ def _has_nopasswd_option(listing: str) -> bool:
 
 
 class PrivilegeError(RuntimeError):
-    """Raised when privileged operation fails (missing sudo, cancelled, or exit error)."""
+    """Raised when privileged operation fails (missing sudo, cancelled, or exit error).
+
+    When the command itself ran and exited non-zero, ``returncode`` and ``detail`` (its own
+    stderr, else stdout) are set, so a caller can read the command's words apart from ours.
+    """
+
+    def __init__(self, message: str, *, returncode: int | None = None, detail: str = "") -> None:
+        super().__init__(message)
+        self.returncode = returncode
+        self.detail = detail
 
 
 Prompter = Callable[[Capability, str], "str | None"]
@@ -175,7 +184,7 @@ class PrivilegeBroker:
         cwd: str | None = None,
         timeout: float = _DEFAULT_RUN_TIMEOUT_S,
         reason: str = "",
-        stdin: str | None = None,
+        stdin: str | bytes | None = None,
         allow_prompt: bool = True,
     ) -> subprocess.CompletedProcess[str]:
         """Run sudo argv for capability, prompting if needed. Raises PrivilegeError on failure.
@@ -185,7 +194,13 @@ class PrivilegeBroker:
         call raises instead of prompting. Background callers (e.g. auto
         time-sync) pass this so a sync can never pop an unsolicited prompt,
         regardless of a stale PASSWORDLESS cache verdict.
+
+        ``bytes`` on stdin need ``allow_prompt=False``: a prompted run sends the
+        password down the same pipe. The output still comes back as text.
         """
+        binary = isinstance(stdin, bytes)
+        if binary and allow_prompt:
+            raise ValueError("bytes on stdin need allow_prompt=False")
         # Defence-in-depth: in-process allow-set must match the sudoers rule,
         # so a caller can't pair a capability with an arbitrary argv.
         try:
@@ -202,24 +217,25 @@ class PrivilegeBroker:
 
         # Try non-interactive first regardless of cached_state (warm timestamp cache helps).
         try:
-            proc = subprocess.run(
+            raw = subprocess.run(
                 ["sudo", "-n", *argv],
                 cwd=run_cwd,
                 input=stdin,
                 capture_output=True,
-                text=True,
+                text=not binary,
                 timeout=timeout,
                 check=False,
                 env=env,
             )
         except subprocess.TimeoutExpired as exc:
             raise PrivilegeError(f"{capability.description}: timed out after {timeout:g}s.") from exc
+        proc = _decoded(raw) if binary else raw
         if proc.returncode == 0:
             return proc
         stderr = (proc.stderr or "").strip()
         if _PASSWORD_REQUIRED_MARKER not in stderr.lower():
             # Non-password failure (command exited non-zero or user not in sudoers).
-            raise PrivilegeError(_format_failure(capability, proc))
+            raise _exit_failure(capability, proc)
         # Invalidate cache; re-probe after password succeeds.
         self.invalidate(capability)
 
@@ -244,7 +260,7 @@ class PrivilegeBroker:
                 cwd=run_cwd,
                 timeout=timeout,
                 env=env,
-                extra_stdin=stdin,
+                extra_stdin=cast(str | None, stdin),
             )
         finally:
             # Best-effort wipe of the locally-held password. CPython
@@ -283,7 +299,22 @@ class PrivilegeBroker:
         if proc.returncode == 0:
             # Successful; caller invalidates cache if needed.
             return proc
-        raise PrivilegeError(_format_failure(capability, proc))
+        raise _exit_failure(capability, proc)
+
+
+def _decoded(proc: subprocess.CompletedProcess[bytes]) -> subprocess.CompletedProcess[str]:
+    """A binary run's result with its output as text, the way every caller reads it."""
+    return subprocess.CompletedProcess(
+        proc.args,
+        proc.returncode,
+        (proc.stdout or b"").decode("utf-8", "replace"),
+        (proc.stderr or b"").decode("utf-8", "replace"),
+    )
+
+
+def _exit_failure(capability: Capability, proc: subprocess.CompletedProcess[str]) -> PrivilegeError:
+    detail = (proc.stderr or proc.stdout or "").strip()
+    return PrivilegeError(_format_failure(capability, proc), returncode=proc.returncode, detail=detail)
 
 
 def _format_failure(

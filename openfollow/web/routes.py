@@ -78,6 +78,7 @@ from openfollow.network.adapter import Ipv4Config, Ipv4Method
 from openfollow.network.validate import parse_prefix, validate_apply
 from openfollow.palette import AUTO_PICK_ORDER
 from openfollow.privilege.camera_config import AUTOMATIC
+from openfollow.runtime.diagnostics_export import WEB, ExportStatus, status_lines
 from openfollow.templates import (
     TEMPLATE_FILE_SUFFIX,
     TEMPLATE_LEGACY_SUFFIX,
@@ -2924,6 +2925,76 @@ def _detection_models_dir(cfg: AppConfig) -> dict[str, str]:
     return {"dir": str(directory), "configured": str(cfg.detection.model or "")}
 
 
+_DRIVE_SAVE_UNWIRED = "Saving to a USB storage device is not available on this station."
+
+
+def _export_status(status: ExportStatus) -> dict[str, Any]:
+    """The export's status for the web dialog, in the Operator Screen's words."""
+    headline, next_step, ok = status_lines(status)
+    return {
+        "phase": status.phase,
+        "origin": status.origin,
+        "generation": status.generation,
+        "ok": ok,
+        "headline": headline,
+        "next_step": next_step,
+    }
+
+
+def _save_failed(status: int, error: str, action: str = "") -> HTTPResponse:
+    """A refused or failed save, in the ``{error, action}`` shape the save-feedback line reads."""
+    body = json.dumps({"error": error, "action": action})
+    return HTTPResponse(body=body, status=status, headers={"Content-Type": "application/json"})
+
+
+def build_diagnostics_bundle(server: ConfigWebServer, cfg: AppConfig | None = None) -> tuple[str, str]:
+    """The diagnostics bundle as ``(filename, text)``, with the station's own copy written.
+
+    The download, a save to a drive and the HUD all go through here, so every
+    copy carries the same content and name. Off a request the config is read
+    from disk.
+    """
+    cfg = cfg or load_config(server.config_path)
+    # Size the operator's configured detection model store alongside
+    # the SD card so the storage breakdown shows where models live
+    # (NVMe vs. an SD-card fallback). Expand ``~`` first – the
+    # detection runtime resolves storage_path with ``expanduser()``
+    # and requires it absolute *after* expansion, so a ``~/...`` value
+    # is valid and must be included. A still-relative value resolves
+    # against the checkout, already covered by repo_root.
+    from openfollow.video.detection import resolve_detection_storage_path
+
+    extra_storage: list[Path] = []
+    # Resolve the same effective path the runtime uses, so a blank field on
+    # an NVMe unit reports the SSD store rather than mislabelling models as
+    # living on the SD card.
+    storage_path = resolve_detection_storage_path(cfg.detection.storage_path)
+    expanded = Path(storage_path).expanduser()
+    if expanded.is_absolute():
+        extra_storage.append(expanded)
+    bundle = diagnostics.collect_bundle(
+        providers=_build_diagnostics_providers(server, cfg),
+        log_ring=server.log_ring,
+        update_service_name=cfg.update_service_name or None,
+        repo_root=_repo_root_for_diagnostics(),
+        extra_storage_paths=extra_storage or None,
+    )
+    text = diagnostics.format_bundle(bundle)
+    # Best-effort on-disk copy. Failure (read-only fs, no perms)
+    # logs but does not break the download – operators on locked-
+    # down deployments still get the bundle through the browser.
+    written_at = datetime.now(timezone.utc)
+    diagnostics.write_bundle_to_disk(
+        text,
+        system_name=server.system_name,
+        ts=written_at,
+    )
+    # Reuse the disk writer's filename helper so ``system_name`` lands
+    # sanitised – an operator-configurable value can otherwise inject
+    # double-quotes / newlines into the ``Content-Disposition`` header.
+    return diagnostics.bundle_filename(server.system_name, written_at), text
+
+
 def _build_diagnostics_providers(
     server: ConfigWebServer,
     cfg: AppConfig,
@@ -4928,48 +4999,67 @@ def setup_routes(app: Bottle, server: ConfigWebServer) -> None:
     def api_diagnostics_bundle() -> Any:
         """Build the full bundle, write a copy to disk, return as text
         download. Filename: ``ofdiag-<system>-<ts>.txt``, the same on disk."""
-        cfg = _request_scoped_config()
-        # Size the operator's configured detection model store alongside
-        # the SD card so the storage breakdown shows where models live
-        # (NVMe vs. an SD-card fallback). Expand ``~`` first – the
-        # detection runtime resolves storage_path with ``expanduser()``
-        # and requires it absolute *after* expansion, so a ``~/...`` value
-        # is valid and must be included. A still-relative value resolves
-        # against the checkout, already covered by repo_root.
-        from openfollow.video.detection import resolve_detection_storage_path
-
-        extra_storage: list[Path] = []
-        # Resolve the same effective path the runtime uses, so a blank field on
-        # an NVMe unit reports the SSD store rather than mislabelling models as
-        # living on the SD card.
-        storage_path = resolve_detection_storage_path(cfg.detection.storage_path)
-        expanded = Path(storage_path).expanduser()
-        if expanded.is_absolute():
-            extra_storage.append(expanded)
-        bundle = diagnostics.collect_bundle(
-            providers=_build_diagnostics_providers(server, cfg),
-            log_ring=server.log_ring,
-            update_service_name=cfg.update_service_name or None,
-            repo_root=_repo_root_for_diagnostics(),
-            extra_storage_paths=extra_storage or None,
-        )
-        text = diagnostics.format_bundle(bundle)
-        # Best-effort on-disk copy. Failure (read-only fs, no perms)
-        # logs but does not break the download – operators on locked-
-        # down deployments still get the bundle through the browser.
-        written_at = datetime.now(timezone.utc)
-        diagnostics.write_bundle_to_disk(
-            text,
-            system_name=server.system_name,
-            ts=written_at,
-        )
-        # Reuse the disk writer's filename helper so ``system_name`` lands
-        # sanitised – an operator-configurable value can otherwise inject
-        # double-quotes / newlines into the ``Content-Disposition`` header.
-        fname = diagnostics.bundle_filename(server.system_name, written_at)
+        fname, text = build_diagnostics_bundle(server, _request_scoped_config())
         response.content_type = "text/plain; charset=utf-8"
         response.headers["Content-Disposition"] = f'attachment; filename="{fname}"'
         return text
+
+    @app.get("/api/diagnostics/drives")
+    def api_diagnostics_drives() -> Any:
+        """The USB storage devices for the Save dialog, listed afresh; one that can't be written says why."""
+        provider = server.media_list_provider
+        if provider is None:
+            return _save_failed(503, _DRIVE_SAVE_UNWIRED)
+        return {
+            "media": [{"id": m.id, "label": m.label, "writable": m.writable, "reason": m.reason} for m in provider()]
+        }
+
+    @app.get("/api/diagnostics/export")
+    def api_diagnostics_export_status() -> Any:
+        """Where the save to a USB storage device is, worded as the Operator Screen words it.
+
+        ``?generation=N`` asks for the dialog's own web export, which a newer one may already have replaced.
+        """
+        export = server.diagnostics_export
+        if export is None:
+            return _save_failed(503, _DRIVE_SAVE_UNWIRED)
+        mine = export.last_done(WEB)
+        if mine is not None and request.query.get("generation") == str(mine.generation):
+            return _export_status(mine)
+        return _export_status(export.status())
+
+    @app.post("/api/diagnostics/export")
+    def api_diagnostics_export_start() -> Any:
+        """Start saving the bundle to the picked device, on the export's worker; only a freshly listed id is taken."""
+        export, provider = server.diagnostics_export, server.media_list_provider
+        if export is None or provider is None:
+            return _save_failed(503, _DRIVE_SAVE_UNWIRED)
+        media_id = request.forms.getunicode("media_id") or ""
+        listed = provider()
+        if not media_id:
+            # Nothing is picked when no row can be.
+            if not listed:
+                return _save_failed(400, "No USB storage device is attached.", "Plug one in, then save again.")
+            if not any(m.writable for m in listed):
+                return _save_failed(
+                    400, "None of the attached USB storage devices can be written.", "The list says why for each one."
+                )
+            return _save_failed(400, "No USB storage device is picked.", "Pick one, then save again.")
+        media = next((m for m in listed if m.id == media_id), None)
+        if media is None:
+            return _save_failed(
+                400, "That USB storage device is no longer attached.", "Pick a USB storage device, then save again."
+            )
+        if not media.writable:
+            return _save_failed(
+                400, f"{media.name} can't be written: {media.reason}.", "Pick another USB storage device."
+            )
+        if not export.start(media.id, media.name, WEB):
+            return _save_failed(
+                409, "Another diagnostics export is still running.", "Wait for it to finish, then save again."
+            )
+        response.status = 202
+        return _export_status(export.status())
 
     @app.get("/api/diagnostics/log-tail")
     def api_diagnostics_log_tail() -> Any:

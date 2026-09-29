@@ -402,7 +402,8 @@
  /* Segmented two-option toggle (Tracking Mode): equal-width cells. */
  .seg-toggle { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; max-width: 30rem; padding: 4px; border: 1px solid var(--border-soft); border-radius: 0.7rem; background: rgba(0, 0, 0, 0.22); }
  .seg-toggle--3 { grid-template-columns: repeat(3, 1fr); max-width: 36rem; }
- .seg-toggle .seg-option { margin: 0; display: flex; cursor: pointer; }
+ /* An option is a <label>: it reads in normal case, not the form label's caps. */
+ .seg-toggle .seg-option { margin: 0; display: flex; cursor: pointer; text-transform: none; letter-spacing: normal; }
  .seg-toggle .seg-option input { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
  .seg-toggle .seg-option > span { flex: 1; display: flex; flex-direction: column; gap: 1px; padding: 0.4rem 0.95rem; border-radius: 0.5rem; color: var(--muted); text-align: center; transition: background 0.12s, color 0.12s; }
  .seg-toggle .seg-option > span strong { font-size: 0.9rem; font-weight: 700; }
@@ -411,7 +412,7 @@
  .seg-toggle .seg-option input:focus-visible + span { outline: 2px solid var(--accent); outline-offset: 2px; }
  /* Row-sized: one line, no sub-label, as wide as its labels. */
  .seg-toggle--compact { display: inline-grid; grid-template-columns: repeat(3, auto); gap: 2px; max-width: none; padding: 2px; border-radius: 0.55rem; }
- .seg-toggle--compact .seg-option > span { padding: 0.22rem 0.6rem; border-radius: 0.4rem; font-size: 0.78rem; font-weight: 700; white-space: nowrap; }
+ .seg-toggle--compact .seg-option > span { padding: 0.22rem 0.6rem; border-radius: 0.4rem; font-size: var(--btn-font-sm); font-weight: 700; white-space: nowrap; }
  .tier-list { display: flex; flex-direction: column; gap: 6px; max-width: 32rem; }
  .tier-option { margin: 0; display: flex; cursor: pointer; }
  .tier-option input { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
@@ -1187,10 +1188,14 @@
  border: 2px solid var(--success-mark-muted); border-radius: 999px;
  background: var(--success-mark); background-clip: content-box; font-size: 0;
  }
+ /* Every table: one text size (the row buttons'), centred cells, muted headers, a row's actions at the right edge. */
+ .data-table { width: 100%; border-collapse: collapse; font-size: var(--btn-font-sm); }
+ .data-table th, .data-table td { text-align: left; vertical-align: middle; padding: 0.4rem 0.6rem; border-bottom: 1px solid var(--border-soft); }
+ .data-table thead th { color: var(--muted); font-weight: 600; }
+ .data-table input, .data-table select { font-size: inherit; }
+ .data-table td.row-actions { white-space: nowrap; text-align: right; }
+ .data-table td.row-actions > * + * { margin-left: 0.4rem; }
  /* Controller Slots table (Input tab). */
- .slot-table { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
- .slot-table th, .slot-table td { text-align: left; vertical-align: top; padding: 6px 8px; border-bottom: 1px solid var(--border-soft); }
- .slot-table thead th { color: var(--muted); font-weight: 600; font-size: 0.8rem; }
  .slot-row.slot-missing { background: var(--error-row); }
  /* Grey while the slot needs nothing, red when its controller is missing. */
  .slot-state {
@@ -1199,14 +1204,14 @@
  color: rgba(247, 245, 233, 0.88); background: rgba(255, 255, 255, 0.05); border: 1px solid rgba(255, 255, 255, 0.18);
  }
  .slot-state.missing { color: var(--text); background: var(--error-chip); border-color: var(--error-line); }
- .slot-port { display: block; color: var(--muted); font-size: 0.8rem; }
+ .slot-port { display: block; color: var(--muted); }
  /* What the controller can't do: caution where it affects control, a plain fact otherwise. */
  .slot-notes { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 6px; margin-top: 3px; }
  .slot-note {
  border-radius: 0.4rem; --pill-pad-y: 0.1rem; padding-inline: 0.45rem; font-size: 0.7rem; font-weight: 500; white-space: nowrap;
  color: var(--text); background: var(--caution-chip); border: 1px solid var(--caution-line);
  }
- .slot-note-fact { font-size: 0.78rem; color: var(--muted); white-space: nowrap; }
+ .slot-note-fact { color: var(--muted); white-space: nowrap; }
  .slot-empty { color: var(--muted); }
  .m3d-empty { margin: 0 0 12px; color: var(--muted); }
  .slot-activity { display: inline-block; width: 0.55rem; height: 0.55rem; border-radius: 50%; background: var(--muted); margin: 0 0 0 7px; vertical-align: middle; }
@@ -1217,8 +1222,6 @@
  .slot-marker { display: inline-flex; align-items: center; gap: 0.45rem; }
  /* The marker's own colour, as on its HUD card and catalog swatch. */
  .slot-marker-dot { flex: none; width: 0.7rem; height: 0.7rem; border-radius: 50%; background: var(--marker-color, var(--muted)); }
- .slot-table td.slot-actions { white-space: nowrap; text-align: right; }
- .slot-actions button { margin: 0 0 0 6px; padding: 4px 10px; }
  .peer-item.offline .peer-status {
  width: 8px; height: 8px;
  border: 3px solid var(--error-mark); background-color: var(--error-mark-muted);

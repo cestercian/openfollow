@@ -400,11 +400,9 @@
                 'data-color-picker="full" aria-label="Marker colour"></button></td>' +
             '<td class="cell-soft" data-cell="controlled-by"></td>' +
             '<td data-cell="this-station">' + thisStationToggle('this-station-' + id, id) + '</td>' +
-            '<td>' +
-                '<span style="display:inline-flex;align-items:center;gap:0.4rem;">' +
+            '<td class="row-actions">' +
                 '<button type="button" class="save-btn small" data-action="save">Save</button>' +
                 '<button type="button" class="danger small" data-action="delete">Delete</button>' +
-                '</span>' +
             '</td>';
         window.OpenFollow.attachColorPicker(tr.querySelector('[data-field="color"]'), {
             mode: 'full',
@@ -471,7 +469,7 @@
                 'data-color-picker="full" aria-label="New marker colour"></button></td>' +
             '<td><span id="add-marker-feedback" class="add-feedback" aria-live="polite"></span></td>' +
             '<td data-cell="this-station">' + thisStationToggle('this-station-new', null) + '</td>' +
-            '<td><button type="button" class="save-btn" id="add-marker-btn">Add</button></td>';
+            '<td class="row-actions"><button type="button" class="save-btn small" id="add-marker-btn">Add</button></td>';
         const idIn = tr.querySelector('#new-marker-id');
         const nameIn = tr.querySelector('#new-marker-name');
         const colorTrigger = tr.querySelector('#new-marker-color');
@@ -577,7 +575,7 @@
             '<div class="group">' +
                 '<h3 class="group-title">Shared catalog</h3>' +
                 '<p class="cell-soft">Synced across all stations on the LAN.</p>' +
-                '<table class="marker-catalog-table">' +
+                '<table class="marker-catalog-table data-table">' +
                     '<thead><tr>' +
                         '<th>ID</th><th>Name</th><th>Color</th>' +
                         '<th>Controlled by</th>' +
@@ -658,16 +656,7 @@
 </script>
 
 <style>
-.marker-catalog-table {
-    width: 100%;
-    border-collapse: collapse;
-    margin-top: 0.5rem;
-}
-.marker-catalog-table th, .marker-catalog-table td {
-    padding: 0.4rem 0.6rem;
-    border-bottom: 1px solid rgba(255,255,255,0.08);
-    text-align: left;
-}
+.marker-catalog-table { margin-top: 0.5rem; }
 .marker-catalog-table td[data-cell="this-station"] { white-space: nowrap; }
 /* A This Station save flashes its row's background, green or red, fading back to the row's own. */
 .marker-catalog-table tr.row-saved { animation: row-flash-green 0.8s ease-out; }
@@ -681,11 +670,9 @@
 .marker-catalog-table .conflict-flag, .marker-catalog-table .not-controlled { vertical-align: 1px; }
 .marker-catalog-table .cell-soft, .saved-flash {
     color: rgba(255,255,255,0.75);
-    font-size: 0.92em;
 }
 /* Add-row status line: neutral, green ok, red error. */
 .marker-catalog-table .add-feedback {
-    font-size: 0.92em;
     color: rgba(255,255,255,0.75);
 }
 .marker-catalog-table .add-feedback.ok { color: var(--success-text); font-weight: bold; }

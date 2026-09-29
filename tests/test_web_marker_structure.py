@@ -25,6 +25,9 @@ zones live as separate boxes on the same tab.
 
 from __future__ import annotations
 
+import re
+from pathlib import Path
+
 import pytest
 from bottle import template
 
@@ -304,3 +307,38 @@ class TestThisStationToggle:
         assert "tr.classList.add(ok ? 'row-saved' : 'row-failed');" in body
         assert "@keyframes row-flash-green { from { background-color: var(--success-chip); } }" in body
         assert "@keyframes row-flash-red { from { background-color: var(--error-chip); } }" in body
+
+
+class TestMarkerTableTextSize:
+    """Everything in the catalog table reads at the size of its row buttons; its chips keep their own."""
+
+    @staticmethod
+    def _font_sizes() -> dict[str, list[str]]:
+        css = "".join(re.findall(r"<style[^>]*>(.*?)</style>", _render_marker(), re.S))
+        css = re.sub(r"/\*.*?\*/", "", css, flags=re.S)
+        return {
+            selector.strip(): re.findall(r"font-size\s*:\s*([^;]+)", body)
+            for selector, body in re.findall(r"([^{}]+)\{([^{}]*)\}", css)
+            if "marker-catalog-table" in selector or "saved-flash" in selector
+        }
+
+    def test_the_table_takes_the_shared_size_and_sets_none_of_its_own(self) -> None:
+        assert '<table class="marker-catalog-table data-table">' in _render_marker()
+        sizes = [f"{sel}: {v}" for sel, vs in self._font_sizes().items() for v in vs]
+        assert [s for s in sizes if not s.endswith(": inherit")] == []
+
+    def test_every_text_button_in_the_table_is_small(self) -> None:
+        classes = re.findall(
+            r'<button type="button" class="([^"]+)"[^>]*>(?:Save|Delete|Add)</button>', _render_marker()
+        )
+        assert len(classes) == 3
+        assert all("small" in c.split() for c in classes), classes
+
+    def test_the_this_station_toggle_reads_in_normal_case_at_the_button_size(self) -> None:
+        # Its options are labels, so without this they take the form label's caps and spacing.
+        base = (Path(__file__).resolve().parents[1] / "openfollow/web/templates/base.tpl").read_text(encoding="utf-8")
+        css = re.sub(r"/\*.*?\*/", "", "".join(re.findall(r"<style[^>]*>(.*?)</style>", base, re.S)), flags=re.S)
+        rules = {sel.strip(): body for sel, body in re.findall(r"([^{}]+)\{([^{}]*)\}", css)}
+        assert "text-transform: none" in rules[".seg-toggle .seg-option"]
+        assert "letter-spacing: normal" in rules[".seg-toggle .seg-option"]
+        assert "font-size: var(--btn-font-sm)" in rules[".seg-toggle--compact .seg-option > span"]

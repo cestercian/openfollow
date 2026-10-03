@@ -66,12 +66,14 @@ from openfollow.runtime.overlay_draw_style import (
     COLOR_ACCENT_SOFT,
     COLOR_BG_BASE,
     COLOR_OK,
+    COLOR_SUPPORT_BORDER,
     COLOR_TEXT,
     COLOR_TEXT_MUTED,
     COLOR_WARNING_BORDER,
     COLOR_WARNING_FILL,
+    SUPPORT_DASH,
 )
-from openfollow.runtime.overlay_links import LINKS
+from openfollow.runtime.overlay_links import LINKS, QUIET_MODULES, SUPPORT
 from openfollow.runtime.overlay_state import (
     ButtonDetectionState,
     MarkerOverlayData,
@@ -2506,46 +2508,51 @@ class TestTheDeviceBoxMatchesTheBrowser:
 
 
 class TestSettingsMenuLinkColumns:
-    """The Settings screen ends in the two addresses an operator cannot type.
+    """The Settings screen ends in the addresses an operator cannot type.
 
     The station has no keyboard for a URL and often no second screen, so the
     codes are the usable half and the rows above them must leave room: the list
     takes the height its items need rather than everything left over.
     """
 
-    def test_both_captions_render(self) -> None:
+    @staticmethod
+    def _draw(width: int = 1600, height: int = 900) -> FakeCairo:
         state = _base_state(settings_items=["Network"], settings_items_enabled=[True])
         cr = FakeCairo()
-        draw_settings_menu(FakeRenderer(state=state), cr, state, 1600, 900)
-        blob = " ".join(cr.show_text_strings())
-        assert "openfollow.app/docs" in blob
-        assert "Discord" in blob
+        draw_settings_menu(FakeRenderer(state=state), cr, state, width, height)
+        return cr
 
-    def test_both_codes_render(self) -> None:
-        state = _base_state(settings_items=["Network"], settings_items_enabled=[True])
-        cr = FakeCairo()
-        draw_settings_menu(FakeRenderer(state=state), cr, state, 1600, 900)
-        dark = sum(sum(row.count("#") for row in code.symbol) for code in LINKS)
-        # Module squares are the only rects drawn at a repeated tiny size.
-        sizes: dict[float, int] = {}
-        for rect in cr.rects:
-            sizes[round(rect[2], 4)] = sizes.get(round(rect[2], 4), 0) + 1
-        assert max(sizes.values()) >= dark
+    @staticmethod
+    def _codes(cr: FakeCairo) -> list[list[tuple[float, float, float, float]]]:
+        """The drawn modules, grouped into one list per code from left to right."""
+        modules = sorted((r for r in cr.rects if r[2] == r[3] and r[2] < 10.0), key=lambda r: r[0])
+        codes: list[list[tuple[float, float, float, float]]] = [[modules[0]]]
+        for rect in modules[1:]:
+            if rect[0] - max(r[0] for r in codes[-1]) > 2 * rect[2]:
+                codes.append([])
+            codes[-1].append(rect)
+        return codes
+
+    def test_every_caption_renders_in_full(self) -> None:
+        """Three columns are narrower than two were; no authored line may lose its end."""
+        drawn = self._draw().show_text_strings()
+        for code in LINKS:
+            for line in code.lines:
+                assert line in drawn
+
+    def test_every_code_renders(self) -> None:
+        codes = self._codes(self._draw())
+        assert [len(c) for c in codes] == [sum(row.count("#") for row in code.symbol) for code in LINKS]
 
     def test_the_codes_sit_side_by_side_on_one_line(self) -> None:
-        state = _base_state(settings_items=["Network"], settings_items_enabled=[True])
-        cr = FakeCairo()
-        draw_settings_menu(FakeRenderer(state=state), cr, state, 1600, 900)
-        module = min(r[2] for r in cr.rects if r[2] > 0.0)
-        modules = [r for r in cr.rects if r[2] == pytest.approx(module)]
-        midpoint = (min(r[0] for r in modules) + max(r[0] for r in modules)) / 2.0
-        left = [r for r in modules if r[0] < midpoint]
-        right = [r for r in modules if r[0] >= midpoint]
-        assert left and right
-        # Both codes start on the same line, whatever their captions wrapped to.
-        assert min(r[1] for r in left) == pytest.approx(min(r[1] for r in right))
-        # And they are separate columns, not one code split down the middle.
-        assert min(r[0] for r in right) - max(r[0] for r in left) > module
+        """Each code's white field starts on the same line, whatever its own size
+        or its caption; and they are separate columns, not one code split up."""
+        codes = self._codes(self._draw())
+        assert len(codes) == len(LINKS)
+        fields = [min(r[1] for r in c) - QUIET_MODULES * c[0][2] for c in codes]
+        assert fields == pytest.approx([fields[0]] * len(LINKS))
+        for left, right in zip(codes, codes[1:], strict=False):
+            assert min(r[0] for r in right) - max(r[0] for r in left) > right[0][2]
 
     def test_the_list_takes_its_rows_not_the_whole_panel(self) -> None:
         """Two items must not produce the same list box as eight."""
@@ -2572,6 +2579,100 @@ class TestSettingsMenuLinkColumns:
         draw_settings_menu(FakeRenderer(state=state), cr, state, 640, 320)
         blob = " ".join(cr.show_text_strings())
         assert "openfollow.app/docs" not in blob
+        assert "Support OpenFollow" not in blob
+
+
+class TestSettingsMenuSupportColumn:
+    """The Support OpenFollow column reads as a request, not as another link."""
+
+    @staticmethod
+    def _draw(width: int = 1600, height: int = 900) -> FakeCairo:
+        state = _base_state(settings_items=["Network"], settings_items_enabled=[True])
+        cr = FakeCairo()
+        draw_settings_menu(FakeRenderer(state=state), cr, state, width, height)
+        return cr
+
+    @staticmethod
+    def _box(modules: list[tuple[float, float, float, float]]) -> tuple[float, float, float, float]:
+        """A code's white field as (left, top, right, bottom), quiet zone included."""
+        quiet = QUIET_MODULES * modules[0][2]
+        return (
+            min(r[0] for r in modules) - quiet,
+            min(r[1] for r in modules) - quiet,
+            max(r[0] + r[2] for r in modules) + quiet,
+            max(r[1] + r[3] for r in modules) + quiet,
+        )
+
+    @classmethod
+    def _frame_and_content(cls, cr: FakeCairo) -> tuple[tuple[float, ...], tuple[float, ...]]:
+        """The dashed frame's edges and the support column's ink, each as (left, top, right, bottom)."""
+        at = cr.calls.index(("dash", SUPPORT_DASH, 0.0))
+        start = max(i for i, c in enumerate(cr.calls[:at]) if c == ("save",))
+        xs, ys = zip(*(c[1:3] for c in cr.calls[start:at] if c[0] in {"move_to", "line_to"}), strict=True)
+        field = cls._box(TestSettingsMenuLinkColumns._codes(cr)[LINKS.index(SUPPORT)])
+        lefts = [field[0], min(min(c[1], c[3], c[5]) for c in cr.calls if c[0] == "curve_to")]
+        rights = [field[2]]
+        measure = FakeCairo()
+        for line in SUPPORT.lines:
+            text = next(t for t in cr.texts if t.text == line)
+            measure.set_font_size(text.font_size)
+            lefts.append(text.x)
+            rights.append(text.x + measure.text_extents(line).width)
+        title = next(t for t in cr.texts if t.text == SUPPORT.lines[0])
+        measure.set_font_size(title.font_size)
+        top = title.y + measure.text_extents(title.text).y_bearing
+        return (min(xs), min(ys), max(xs), max(ys)), (min(lefts), top, max(rights), field[3])
+
+    def test_only_the_support_column_is_framed_dashed(self) -> None:
+        dashes = [c for c in self._draw().calls if c[0] == "dash"]
+        assert dashes == [("dash", SUPPORT_DASH, 0.0)]
+
+    def test_the_frame_takes_the_websites_edge_colour(self) -> None:
+        """The same dashed gold as the website's card, so both read as one request."""
+        calls = self._draw().calls
+        at = calls.index(("dash", SUPPORT_DASH, 0.0))
+        colour = next(c for c in reversed(calls[:at]) if c[0] in {"rgb", "rgba"})
+        assert colour == ("rgba", *COLOR_SUPPORT_BORDER)
+
+    def test_the_dash_ends_with_the_frame(self) -> None:
+        """Left set, the dash would carry into every later stroke on the screen."""
+        calls = self._draw().calls
+        at = calls.index(("dash", SUPPORT_DASH, 0.0))
+        saved = max(i for i, c in enumerate(calls[:at]) if c == ("save",))
+        restored = next(i for i, c in enumerate(calls[at:], start=at) if c == ("restore",))
+        assert sum(1 for c in calls[saved:restored] if c == ("save",)) == 1
+        assert ("stroke",) in calls[at:restored]
+
+    @pytest.mark.parametrize(
+        "size",
+        [(1600, 900), (1100, 600), (1120, 900)],
+        ids=["code-widest", "caption-widest", "code-fills-its-column"],
+    )
+    def test_the_frame_leaves_the_same_space_on_all_four_sides(self, size: tuple[int, int]) -> None:
+        """The frame hugs the caption and the code, not the column they are centred in."""
+        frame, content = self._frame_and_content(self._draw(*size))
+        gaps = [content[0] - frame[0], content[1] - frame[1], frame[2] - content[2], frame[3] - content[3]]
+        assert gaps[0] > 0
+        assert gaps == pytest.approx([gaps[0]] * 4, abs=0.5)
+
+    def test_the_frame_keeps_clear_of_the_next_code(self) -> None:
+        """Where the code fills its column the space shrinks on every side rather than crowd its neighbour."""
+        cr = self._draw(1120, 900)
+        frame, content = self._frame_and_content(cr)
+        neighbour = self._box(TestSettingsMenuLinkColumns._codes(cr)[LINKS.index(SUPPORT) - 1])
+        pad = content[0] - frame[0]
+        assert pad > 0
+        assert frame[0] - neighbour[2] >= pad - 1e-6
+
+    def test_a_heart_leads_the_accent_title(self) -> None:
+        cr = self._draw()
+        title = next(t for t in cr.texts if t.text == SUPPORT.lines[0])
+        assert title.rgba[:3] == COLOR_ACCENT
+        hearts = [c for c in cr.calls if c[0] == "curve_to"]
+        assert len(hearts) == 6
+        assert max(max(c[1], c[3], c[5]) for c in hearts) < title.x
+        for line in SUPPORT.lines[1:]:
+            assert next(t for t in cr.texts if t.text == line).rgba == COLOR_TEXT_MUTED
 
 
 class TestDriveScreens:

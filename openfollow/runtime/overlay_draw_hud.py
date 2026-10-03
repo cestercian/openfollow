@@ -21,6 +21,7 @@ from openfollow.runtime.overlay_draw_style import (
     COLOR_BG_BASE,
     COLOR_BORDER_SOFT,
     COLOR_OK,
+    COLOR_SUPPORT_BORDER,
     COLOR_TEXT,
     COLOR_TEXT_MUTED,
     COLOR_WARNING_BORDER,
@@ -28,7 +29,9 @@ from openfollow.runtime.overlay_draw_style import (
     MODAL_RADIUS,
     PANEL_RADIUS,
     ROW_RADIUS,
+    SUPPORT_DASH,
     draw_card_background,
+    draw_heart,
     draw_rounded_rect,
     draw_success_sign,
     draw_warning_sign,
@@ -195,6 +198,9 @@ _DOCS_COL_GAP = 20.0
 _DOCS_QR_MAX = 190.0
 # Below this the code is too small to read off a screen, so draw nothing.
 _DOCS_QR_MIN = 70.0
+_HEART_GAP = 5.0
+# The same on all four sides of the support column's content; never past the column gap's midline.
+_FRAME_PAD = 14.0
 
 
 def draw_selectable_list(
@@ -729,13 +735,40 @@ def _draw_link_column(
     reading over their shoulder where it leads.
     """
     renderer._set_ui_font(cr, _DOCS_FONT)
-    cr.set_source_rgba(*COLOR_TEXT_MUTED)
+    rows = []
     for row, authored in enumerate(code.lines):
-        line = renderer._truncate_text_to_width(cr, authored, w)
-        ext = cr.text_extents(line)
-        cr.move_to(x + (w - ext.width) / 2.0, y + (row + 1) * _DOCS_LINE_H)
+        heart = _DOCS_FONT + _HEART_GAP if code.contribution and row == 0 else 0.0
+        line = renderer._truncate_text_to_width(cr, authored, w - heart)
+        rows.append((line, heart, cr.text_extents(line)))
+    qr_y = y + text_h + _DOCS_GAP
+    if code.contribution:
+        content_w = max([qr_size] + [ext.width + heart for _, heart, ext in rows])
+        top = y + _DOCS_LINE_H + rows[0][2].y_bearing
+        _draw_contribution_frame(cr, x + (w - content_w) / 2.0, top, content_w, qr_y + qr_size - top, w)
+    for row, (line, heart, ext) in enumerate(rows):
+        lead = heart > 0.0
+        left = x + (w - ext.width - heart) / 2.0
+        baseline = y + (row + 1) * _DOCS_LINE_H
+        if lead:
+            draw_heart(cr, left + _DOCS_FONT / 2.0, baseline - _DOCS_FONT * 0.35, _DOCS_FONT)
+            cr.set_source_rgb(*COLOR_ACCENT)
+        else:
+            cr.set_source_rgba(*COLOR_TEXT_MUTED)
+        cr.move_to(left + heart, baseline)
         cr.show_text(line)
-    draw_link_qr(cr, code, x + (w - qr_size) / 2.0, y + text_h + _DOCS_GAP, qr_size)
+    draw_link_qr(cr, code, x + (w - qr_size) / 2.0, qr_y, qr_size)
+
+
+def _draw_contribution_frame(cr: Any, x: float, y: float, w: float, h: float, col_w: float) -> None:
+    """The dashed edge that marks the Support OpenFollow column as a request, around its content box."""
+    pad = min(_FRAME_PAD, (col_w + _DOCS_COL_GAP - w) / 2.0)
+    cr.save()
+    draw_rounded_rect(cr, x - pad, y - pad, w + 2 * pad, h + 2 * pad, PANEL_RADIUS)
+    cr.set_source_rgba(*COLOR_SUPPORT_BORDER)
+    cr.set_line_width(1.5)
+    cr.set_dash(SUPPORT_DASH)
+    cr.stroke()
+    cr.restore()
 
 
 def _draw_settings_info_card(

@@ -31,6 +31,7 @@ from openfollow.runtime.services_detection_pin import (
     _prune_pin_states,
     apply_detection_pin,
     assist_active,
+    detection_status,
     get_or_create_manual_marker,
     is_assist_controlled,
 )
@@ -46,17 +47,26 @@ class _StubDetection:
         x2: float,
         y2: float,
         track_id: int = -1,
+        confidence: float = 0.9,
+        age_s: float = 0.0,
     ) -> None:
         self.x1 = x1
         self.y1 = y1
         self.x2 = x2
         self.y2 = y2
         self.track_id = track_id
+        self.confidence = confidence
+        self.age_s = age_s
 
 
 class _StubDetector:
-    def __init__(self, detection) -> None:  # noqa: ANN001
+    def __init__(  # noqa: ANN001
+        self, detection, *, confidence_threshold: float = 0.2, coast_s: float = 0.5, available: bool = True
+    ) -> None:
         self.tracked_detection = detection
+        self.confidence_threshold = confidence_threshold
+        self.coast_s = coast_s
+        self.available = available
 
 
 class _StubCamera:
@@ -81,13 +91,19 @@ class _StubMarker:
     def __init__(self, marker_id: int = 0) -> None:
         self._pos = (0.0, 0.0, 0.0)
         self.marker_id = marker_id
+        self.status = 1.0
 
     @property
     def pos(self) -> tuple[float, float, float]:
         return self._pos
 
-    def set_pos(self, x: float, y: float, z: float) -> None:
+    def set_pos(self, x: float, y: float, z: float, *, status: float | None = None) -> None:
         self._pos = (x, y, z)
+        if status is not None:
+            self.status = status
+
+    def set_status(self, status: float) -> None:
+        self.status = status
 
 
 class _StubServer:
@@ -141,6 +157,7 @@ def _make_app(
         _server=server,
         _assist_manual={},
         _detection_pin_states={},
+        _detection_pin_mode=None,
         _selected_id=selected_id,
         # ``pin_marker_id`` looks at controlled_ids when the operator picks a
         # fixed ID. Default to a single-marker list matching ``selected_id``
@@ -910,6 +927,9 @@ def test_replace_mode_does_not_read_detections(monkeypatch) -> None:
     class _ReplaceOnlyDetector:
         def __init__(self, tracked: _StubDetection) -> None:
             self.tracked_detection = tracked
+            self.confidence_threshold = 0.2
+            self.coast_s = 0.5
+            self.available = True
 
         @property
         def detections(self):  # noqa: ANN202
@@ -1179,3 +1199,398 @@ def test_assist_pin_undistorts_screen_when_lens_set(monkeypatch) -> None:
     undist = np.hypot(recorded["screen"][0, 0] - cx, recorded["screen"][0, 1] - cy)
     # Undistorting a barrel-distorted detection pin pushes it outward.
     assert undist > raw
+
+
+# ---------------------------------------------------------------------------
+# PSN tracker status. Fully Automatic publishes how much detection vouches for
+# the position it writes; every path that stops driving a marker hands back 1.0.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("score", "threshold", "expected"),
+    [
+        (0.2, 0.2, 0.5),  # at the threshold: just accepted
+        (1.0, 0.2, 1.0),  # a perfect score
+        (0.6, 0.2, 0.75),  # halfway up the accepted band
+        (0.1, 0.2, 0.4375),  # a low-band recovery match continues the line below 0.5
+        (0.0, 0.5, 0.0),  # clamped at 0
+        (0.5, 1.0, 1.0),  # a threshold of 1 leaves nothing to grade by
+        (0.9, 1.5, 1.0),
+    ],
+)
+def test_detection_status_rescales_the_score_around_the_threshold(
+    score: float, threshold: float, expected: float
+) -> None:
+    assert detection_status(score, threshold, grace_s=0.5) == pytest.approx(expected)
+
+
+@pytest.mark.parametrize(("age_s", "factor"), [(0.0, 1.0), (0.25, 0.5), (0.5, 0.0), (0.75, 0.0)])
+def test_detection_status_decays_linearly_across_the_grace_period(age_s: float, factor: float) -> None:
+    matched = detection_status(0.6, 0.2, grace_s=0.5)
+    assert detection_status(0.6, 0.2, age_s=age_s, grace_s=0.5) == pytest.approx(matched * factor)
+
+
+def test_detection_status_with_no_grace_is_invalid_the_moment_the_track_is_lost() -> None:
+    assert detection_status(0.9, 0.2, age_s=0.001, grace_s=0.0) == 0.0
+    assert detection_status(0.9, 0.2, age_s=0.0, grace_s=0.0) == pytest.approx(detection_status(0.9, 0.2, grace_s=1.0))
+
+
+def _status_cfg(**overrides) -> DetectionConfig:  # noqa: ANN003
+    base = {
+        "enabled": True,
+        "pin_mode": "replace",
+        "smoothing": 1.0,
+        "prediction": 0.0,
+        "confidence": 0.2,
+        "grace_period_ms": 500,
+    }
+    base.update(overrides)
+    return DetectionConfig(**base)  # type: ignore[arg-type]
+
+
+def _tracked(score: float, *, age_s: float = 0.0) -> _StubDetection:
+    return _StubDetection(0.45, 0.0, 0.55, 0.1, track_id=4, confidence=score, age_s=age_s)
+
+
+def test_replace_writes_the_matched_detection_status(monkeypatch) -> None:
+    app = _make_app(detection_cfg=_status_cfg(), resolution=(1000, 1000))
+    marker = app._server.get_marker(0)
+
+    _run(app, _StubDetector(_tracked(0.6)), monkeypatch, unproject=_linear_unproject)
+
+    assert marker.status == pytest.approx(0.75)
+    assert app._detection_pin_states[0].status == pytest.approx(0.75)
+
+
+def test_replace_writes_position_and_status_in_one_call(monkeypatch) -> None:
+    """The PSN sender reads position and status under one lock; written in two
+    calls, a packet could pair the new position with the previous frame's status."""
+
+    class _RecordingMarker(_StubMarker):
+        def __init__(self) -> None:
+            super().__init__()
+            self.writes: list[tuple[str, float | None]] = []
+
+        def set_pos(self, x: float, y: float, z: float, *, status: float | None = None) -> None:
+            super().set_pos(x, y, z, status=status)
+            self.writes.append(("pos", status))
+
+        def set_status(self, status: float) -> None:
+            super().set_status(status)
+            self.writes.append(("status", status))
+
+    marker = _RecordingMarker()
+    app = _make_app(detection_cfg=_status_cfg(), resolution=(1000, 1000), marker=marker)
+
+    _run(app, _StubDetector(_tracked(0.6)), monkeypatch, unproject=_linear_unproject)
+
+    assert len(marker.writes) == 1
+    assert marker.writes[0][0] == "pos"
+    assert marker.writes[0][1] == pytest.approx(0.75)
+
+
+def test_replace_decays_the_status_while_the_track_coasts(monkeypatch) -> None:
+    app = _make_app(detection_cfg=_status_cfg(grace_period_ms=500), resolution=(1000, 1000))
+    marker = app._server.get_marker(0)
+
+    _run(app, _StubDetector(_tracked(0.6, age_s=0.25)), monkeypatch, unproject=_linear_unproject)
+
+    assert marker.status == pytest.approx(0.375)
+
+
+def test_replace_grades_against_the_detectors_threshold_not_the_config(monkeypatch) -> None:
+    """The worker drains config changes between frames, so the threshold it
+    actually runs is the detector's, not whatever the config holds this frame."""
+    app = _make_app(detection_cfg=_status_cfg(confidence=0.2), resolution=(1000, 1000))
+    marker = app._server.get_marker(0)
+
+    _run(app, _StubDetector(_tracked(0.6), confidence_threshold=0.6), monkeypatch, unproject=_linear_unproject)
+
+    assert marker.status == pytest.approx(0.5)
+
+
+def test_replace_publishes_invalid_when_nobody_is_tracked(monkeypatch) -> None:
+    app = _make_app(detection_cfg=_status_cfg(), resolution=(1000, 1000))
+    marker = app._server.get_marker(0)
+    _run(app, _StubDetector(_tracked(0.6)), monkeypatch, unproject=_linear_unproject)
+
+    _run(app, _StubDetector(None))
+
+    assert marker.status == 0.0
+    assert app._detection_pin_states[0].status == 0.0
+
+
+def test_replace_decays_against_the_detectors_grace_window_not_the_configs(monkeypatch) -> None:
+    """The worker drains config on its own cadence, so the decay follows the
+    grace window the tracker is actually coasting on."""
+    app = _make_app(detection_cfg=_status_cfg(grace_period_ms=500), resolution=(1000, 1000))
+    marker = app._server.get_marker(0)
+
+    _run(app, _StubDetector(_tracked(0.6, age_s=0.25), coast_s=1.0), monkeypatch, unproject=_linear_unproject)
+
+    assert marker.status == pytest.approx(0.75 * 0.75)
+
+
+def test_replace_leaves_an_external_status_alone_when_the_detector_is_missing() -> None:
+    app = _make_app(detection_cfg=_status_cfg(), resolution=(1000, 1000))
+    marker = app._server.get_marker(0)
+    marker.set_status(0.4)
+
+    _run(app, None)
+
+    assert marker.status == pytest.approx(0.4)
+    assert app._detection_pin_states[0].status is None
+
+
+def test_replace_restores_full_validity_when_the_detector_goes_missing(monkeypatch) -> None:
+    app = _make_app(detection_cfg=_status_cfg(), resolution=(1000, 1000))
+    marker = app._server.get_marker(0)
+    _run(app, _StubDetector(_tracked(0.6)), monkeypatch, unproject=_linear_unproject)
+    assert marker.status == pytest.approx(0.75)
+
+    _run(app, None)
+
+    assert marker.status == 1.0
+    assert app._detection_pin_states[0].status is None
+
+
+def test_replace_writes_invalid_when_the_resolution_is_unknown() -> None:
+    app = _make_app(detection_cfg=_status_cfg(), resolution=(0, 0))
+    marker = app._server.get_marker(0)
+    marker.set_status(0.4)
+
+    _run(app, _StubDetector(_tracked(0.6)))
+
+    assert marker.status == 0.0
+    assert app._detection_pin_states[0].status == 0.0
+
+
+def test_replace_writes_invalid_when_the_pin_point_does_not_unproject(monkeypatch) -> None:
+    app = _make_app(detection_cfg=_status_cfg(), resolution=(1000, 1000))
+    marker = app._server.get_marker(0)
+    marker.set_status(0.4)
+
+    def _nan(*_a, **_k):  # noqa: ANN002, ANN003, ANN202
+        return np.array([[np.nan, np.nan, 0.0]], dtype=np.float64)
+
+    _run(app, _StubDetector(_tracked(0.6)), monkeypatch, unproject=_nan)
+
+    assert marker.status == 0.0
+    assert app._detection_pin_states[0].status == 0.0
+
+
+def test_turning_detection_off_restores_full_validity(monkeypatch) -> None:
+    app = _make_app(detection_cfg=_status_cfg(), resolution=(1000, 1000))
+    marker = app._server.get_marker(0)
+    _run(app, _StubDetector(_tracked(0.6)), monkeypatch, unproject=_linear_unproject)
+    assert marker.status == pytest.approx(0.75)
+
+    app._config.detection = DetectionConfig(enabled=False)
+    _run(app, _StubDetector(_tracked(0.6)))
+
+    assert marker.status == 1.0
+    assert app._detection_pin_states == {}
+
+
+def test_pinning_another_marker_restores_the_one_released(monkeypatch) -> None:
+    m1, m2 = _StubMarker(1), _StubMarker(2)
+    app = _make_app(
+        detection_cfg=_status_cfg(),
+        resolution=(1000, 1000),
+        server=_MultiMarkerServer({1: m1, 2: m2}),
+        selected_id=1,
+        controlled_ids=[1, 2],
+    )
+    _run(app, _StubDetector(_tracked(0.6)), monkeypatch, unproject=_linear_unproject)
+    assert m1.status == pytest.approx(0.75)
+
+    app._selected_id = 2
+    _run(app, _StubDetector(_tracked(0.6)), monkeypatch, unproject=_linear_unproject)
+
+    assert m1.status == 1.0
+    assert m2.status == pytest.approx(0.75)
+
+
+def test_a_detector_with_no_backend_releases_like_no_detector(monkeypatch) -> None:
+    """A detector whose backend never loaded tracks nobody, ever, so it must not
+    hold a hand-driven marker at 0.0 the way a live detector between sightings does."""
+    app = _make_app(detection_cfg=_status_cfg(), resolution=(1000, 1000))
+    marker = app._server.get_marker(0)
+    _run(app, _StubDetector(_tracked(0.6)), monkeypatch, unproject=_linear_unproject)
+    assert marker.status == pytest.approx(0.75)
+
+    _run(app, _StubDetector(None, available=False))
+
+    assert marker.status == 1.0
+    assert app._detection_pin_states[0].status is None
+
+
+def test_a_marker_leaving_the_controlled_set_is_restored(monkeypatch) -> None:
+    m1 = _StubMarker(1)
+    app = _make_app(
+        detection_cfg=_status_cfg(pin_marker_id=1),
+        resolution=(1000, 1000),
+        server=_MultiMarkerServer({1: m1}),
+        selected_id=1,
+        controlled_ids=[1],
+    )
+    _run(app, _StubDetector(_tracked(0.6)), monkeypatch, unproject=_linear_unproject)
+    assert m1.status == pytest.approx(0.75)
+
+    app._controlled_ids = []
+    _run(app, _StubDetector(_tracked(0.6)), monkeypatch, unproject=_linear_unproject)
+
+    assert m1.status == 1.0
+
+
+def test_switching_to_assist_restores_full_validity(monkeypatch) -> None:
+    """The replace-driven marker stays controlled, so pruning by the controlled
+    set alone would keep its state; the mode switch itself sheds it."""
+    m1 = _StubMarker(1)
+    app = _make_app(
+        detection_cfg=_status_cfg(),
+        resolution=(1000, 1000),
+        server=_MultiMarkerServer({1: m1}),
+        selected_id=1,
+        controlled_ids=[1],
+    )
+    _run(app, _StubDetector(_tracked(0.6)), monkeypatch, unproject=_linear_unproject)
+    assert m1.status == pytest.approx(0.75)
+
+    app._config.detection = _assist_cfg()
+    _run(app, _AssistDetector([]), monkeypatch, unproject=_linear_unproject)
+
+    assert m1.status == 1.0
+    assert app._detection_pin_states[1].status is None
+
+
+def test_switching_to_assist_restores_full_validity_without_a_feed(monkeypatch) -> None:
+    """The assist loop exits before driving anything while the feed is down;
+    the release must not wait behind that exit."""
+    m1 = _StubMarker(1)
+    app = _make_app(
+        detection_cfg=_status_cfg(),
+        resolution=(1000, 1000),
+        server=_MultiMarkerServer({1: m1}),
+        selected_id=1,
+        controlled_ids=[1],
+    )
+    _run(app, _StubDetector(_tracked(0.6)), monkeypatch, unproject=_linear_unproject)
+    assert m1.status == pytest.approx(0.75)
+
+    app._config.detection = _assist_cfg()
+    app._video_receiver.resolution = (0, 0)
+    _run(app, _AssistDetector([]), monkeypatch, unproject=_linear_unproject)
+
+    assert m1.status == 1.0
+    assert app._detection_pin_states == {}
+
+
+def test_a_mode_switch_sheds_the_other_modes_smoothing(monkeypatch) -> None:
+    """Replace seeds its filter from the first target it sees. A filter assist
+    left behind would make that first frame glide from assist's last person
+    instead, so the switch starts replace from a clean state."""
+    app = _assist_app(_assist_cfg(assist_radius_m=50.0, smoothing=0.5))
+    marker = app._server.get_marker(_PID)
+    _seed_anchor(app, 2.0, 0.0, 0.0)
+    _run_assist(app, _AssistDetector([_det(0.2, 1)]), monkeypatch)  # inner filter now holds x = 2.0
+    assert app._detection_pin_states[_PID].smooth_x == pytest.approx(2.0)
+
+    app._config.detection = DetectionConfig(enabled=True, pin_mode="replace", smoothing=0.5, prediction=0.0)
+    _run(app, _StubDetector(_det(0.8, 1)), monkeypatch, unproject=_linear_unproject)
+
+    assert marker.pos[0] == pytest.approx(8.0)  # seeded on the new target, not eased from 2.0
+    assert app._assist_manual == {}
+
+
+def test_assist_never_writes_a_status(monkeypatch) -> None:
+    app = _assist_app(_assist_cfg())
+    out = app._server.get_marker(_PID)
+    out.set_status(0.42)  # a sentinel: assist must not touch the field at all
+    _seed_anchor(app, 4.0, 0.0, 0.0)
+
+    _run_assist(app, _AssistDetector([_det(0.5, 1)]), monkeypatch)
+
+    assert out.status == pytest.approx(0.42)
+    assert app._detection_pin_states[_PID].status is None
+
+
+def test_releasing_a_marker_the_server_no_longer_holds_is_tolerated(monkeypatch) -> None:
+    by_id = {1: _StubMarker(1)}
+    app = _make_app(
+        detection_cfg=_status_cfg(),
+        resolution=(1000, 1000),
+        server=_MultiMarkerServer(by_id),
+        selected_id=1,
+        controlled_ids=[1],
+    )
+    _run(app, _StubDetector(_tracked(0.6)), monkeypatch, unproject=_linear_unproject)
+
+    by_id.clear()
+    app._selected_id = None
+    _run(app, _StubDetector(_tracked(0.6)))
+
+    assert app._detection_pin_states == {}
+
+
+def _wire_app(marker, **kw) -> SimpleNamespace:  # noqa: ANN001, ANN003
+    return _make_app(
+        detection_cfg=_status_cfg(**kw),
+        resolution=(1000, 1000),
+        server=_MultiMarkerServer({marker.marker_id: marker}),
+        selected_id=marker.marker_id,
+        controlled_ids=[marker.marker_id],
+    )
+
+
+def test_fully_automatic_status_reaches_the_psn_tracker(monkeypatch) -> None:
+    from openfollow.psn import Marker
+
+    marker = Marker(1, "T1", clock=lambda: 1_000)
+    app = _wire_app(marker)
+
+    _run(app, _StubDetector(_tracked(0.6)), monkeypatch, unproject=_linear_unproject)
+
+    assert marker.to_psn_marker().status == pytest.approx(0.75)
+
+
+def test_staleness_outranks_the_detection_status_on_the_wire(monkeypatch) -> None:
+    from openfollow.psn import Marker
+
+    marker = Marker(1, "T1", clock=lambda: 1_000)
+    app = _wire_app(marker)
+    _run(app, _StubDetector(_tracked(0.6)), monkeypatch, unproject=_linear_unproject)
+
+    assert marker.to_psn_marker(stale=True).status == 0.0
+    assert marker.to_psn_marker().status == pytest.approx(0.75)  # the stored value is untouched
+
+
+def test_nobody_tracked_survives_the_per_frame_speed_write(monkeypatch) -> None:
+    """``build_marker_visual_state`` rewrites every controlled marker's speed
+    each frame, right after the pin. A 0.0 the pin wrote must not be promoted
+    back to valid by that write."""
+    from openfollow.psn import Marker
+
+    marker = Marker(1, "T1", clock=lambda: 1_000)
+    app = _wire_app(marker)
+    _run(app, _StubDetector(_tracked(0.6)), monkeypatch, unproject=_linear_unproject)
+
+    _run(app, _StubDetector(None))
+    marker.set_speed(0.0, 0.0, 0.0)
+
+    assert marker.to_psn_marker().status == 0.0
+
+
+def test_release_restores_full_validity_on_the_wire(monkeypatch) -> None:
+    from openfollow.psn import Marker
+
+    marker = Marker(1, "T1", clock=lambda: 1_000)
+    app = _wire_app(marker)
+    _run(app, _StubDetector(None))
+    assert marker.to_psn_marker().status == 0.0
+
+    app._config.detection = DetectionConfig(enabled=False)
+    _run(app, None)
+
+    assert marker.to_psn_marker().status == 1.0

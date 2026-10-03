@@ -16,8 +16,8 @@ from openfollow.psn.clock import psn_timestamp_usec
 
 Vec3 = tuple[float, float, float]
 _ZERO: Vec3 = (0.0, 0.0, 0.0)
-# PSN_DATA_TRACKER_STATUS carries the tracker's validity as a float. A marker we
-# are actively driving is fully valid; 0.0 means "no data written yet".
+# PSN_DATA_TRACKER_STATUS: 1.0 for a marker the operator drives, less where detection
+# only partly vouches for it. Unwritten is None in memory and 0.0 on the wire.
 _VALID = 1.0
 _INVALID = 0.0
 
@@ -62,9 +62,10 @@ class Marker:
     by an internal lock to prevent torn reads when background PSN threads
     read state while the main thread updates it.
 
-    Every position or speed write stamps ``timestamp`` and marks the marker
-    valid, so a receiver can tell a marker that is still being updated from a
-    stale one. ``set_status`` and ``set_name`` do not stamp.
+    Every position or speed write stamps ``timestamp`` and marks an untouched
+    marker valid, so a receiver can tell a marker that is still being updated
+    from a stale one. A status set explicitly stands, 0.0 included, until the
+    next ``set_status``. ``set_status`` and ``set_name`` do not stamp.
 
     A marker built from received data (``remote=True``, written via
     ``apply_remote``) instead holds what its sender published, timed from that
@@ -106,7 +107,9 @@ class Marker:
         self._ori: Vec3 = _ZERO
         self._accel: Vec3 = _ZERO
         self._trgtpos: Vec3 = _ZERO
-        self._status: float = _INVALID
+        # None until the first data write or an explicit set_status: an
+        # explicit 0.0 must not read as "nothing written yet".
+        self._status: float | None = None
         self._timestamp: int = 0
         self._remote: bool = bool(remote)
         self._clock = clock
@@ -140,7 +143,7 @@ class Marker:
     @property
     def status(self) -> float:
         with self._lock:
-            return self._status
+            return _INVALID if self._status is None else self._status
 
     @property
     def timestamp(self) -> int:
@@ -157,11 +160,18 @@ class Marker:
         """Now, on the clock this marker's timestamps are stamped from."""
         return self._clock()
 
-    def set_pos(self, x: float, y: float, z: float) -> None:
-        """Set the marker position in PSN coordinates."""
+    def set_pos(self, x: float, y: float, z: float, *, status: float | None = None) -> None:
+        """Set the marker position in PSN coordinates.
+
+        ``status`` lands with the position under the one lock, so a reader never
+        pairs this position with the previous frame's validity.
+        """
+        value = None if status is None else _clamped_status(status)
         with self._lock:
             self._pos = (x, y, z)
             self._stamp_locked()
+            if value is not None:
+                self._status = value
 
     def set_name(self, name: str) -> None:
         """Update the marker name (used by live catalog rename)."""
@@ -210,11 +220,12 @@ class Marker:
         ``set_name`` deliberately does not stamp - a rename is metadata, not
         tracker data, and must not make a stale marker look fresh. The first
         data write promotes an untouched marker to valid; an explicit
-        ``set_status`` afterwards stands, so a caller deriving validity from
-        tracking confidence is not overwritten on the next write.
+        ``set_status`` stands, so a caller deriving validity from tracking
+        confidence is not overwritten on the next write, and a 0.0 it set is
+        not promoted either.
         """
         self._timestamp = self._clock()
-        if self._status == _INVALID:
+        if self._status is None:
             self._status = _VALID
 
     def to_psn_marker(self, *, stale: bool = False) -> pypsn.PsnTracker:
@@ -234,7 +245,7 @@ class Marker:
                 ori=pypsn.PsnVector3(*self._ori),
                 accel=pypsn.PsnVector3(*self._accel),
                 trgtpos=pypsn.PsnVector3(*self._trgtpos),
-                status=_INVALID if stale else self._status,
+                status=_INVALID if stale or self._status is None else self._status,
                 timestamp=self._timestamp,
             )
 

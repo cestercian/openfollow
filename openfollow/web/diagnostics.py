@@ -3205,7 +3205,7 @@ def collect_bundle(
         log_times=station_zone(now.astimezone()),
         app_version=openfollow.__version__,
         platform_label=_platform_label(),
-        host_label=f"{platform.node()} ({platform.platform()})",
+        host_label=f"{socket.gethostname()} ({platform.platform()})",
         service_status=("running" if p.web_port_configured is not None else "NOT RUNNING (sample)"),
         redactions_applied="web_pin=***, X-Auth-Signature stripped",
     )

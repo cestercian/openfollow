@@ -1770,6 +1770,22 @@ def test_collect_bundle_runs_with_no_providers() -> None:
         assert getattr(bundle, attr), f"section {attr} unexpectedly empty"
 
 
+def test_collect_bundle_host_label_follows_a_hostname_change(monkeypatch) -> None:
+    """The station renames the host after startup. ``platform.node()`` is cached
+    for the life of the process, so the bundle must read the name live."""
+    monkeypatch.setattr(platform, "node", lambda: "before-rename")
+    monkeypatch.setattr(diag.socket, "gethostname", lambda: "after-rename")
+    monkeypatch.setattr(diag, "_run", lambda cmd, **_kw: (-1, f"[unavailable: {cmd[0]} not found]"))
+
+    bundle = diag.collect_bundle()
+    assert bundle.host_label.startswith("after-rename (")
+    assert "before-rename" not in bundle.host_label
+
+    monkeypatch.setattr(diag.socket, "gethostname", lambda: "renamed-again")
+    assert diag.collect_bundle().host_label.startswith("renamed-again (")
+    assert "host: renamed-again (" in diag.format_bundle(diag.collect_bundle())
+
+
 def test_format_bundle_emits_section_headers() -> None:
     bundle = diag.collect_bundle()
     text = diag.format_bundle(bundle)

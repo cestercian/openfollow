@@ -4778,6 +4778,43 @@
  if (mode === 'replace') { el.removeAttribute('hidden'); } else { el.setAttribute('hidden', ''); }
  });
  });
+ // Marker Visuals: the style radio reveals that style's groups. Each group
+ // carries ``data-style-only="<style>"``; the server renders the ``hidden``
+ // state on first paint, this follows later toggles. Hidden groups still
+ // submit, so a style's settings survive a save made in the other style.
+ // A hidden field cannot show its error, so an invalid edit there goes back
+ // to the stored value rather than keep Save disabled with no reason shown.
+ function restoreHiddenInvalid(group) {
+ group.querySelectorAll('[aria-invalid="true"]').forEach((input) => {
+ input.value = input.defaultValue;
+ input.setAttribute('aria-invalid', 'false');
+ const box = document.getElementById(input.getAttribute('aria-describedby'));
+ if (box) box.innerHTML = '';
+ });
+ }
+ document.addEventListener('change', (event) => {
+ const radio = event.target.closest('input[name="marker_style"]');
+ if (!radio) return;
+ const form = radio.closest('form');
+ if (!form) return;
+ const checked = form.querySelector('input[name="marker_style"]:checked');
+ const style = checked !== null ? checked.value : 'crosshair';
+ form.querySelectorAll('[data-style-only]').forEach((el) => {
+ if (el.dataset.styleOnly === style) { el.removeAttribute('hidden'); return; }
+ el.setAttribute('hidden', '');
+ restoreHiddenInvalid(el);
+ });
+ refreshFormGate(form);
+ });
+ // A field's validation answer waits out the blur delay, so it can land after
+ // the style switch hid its group. Runs after the body-level handler marked it.
+ document.addEventListener('htmx:afterSwap', (event) => {
+ const target = event.detail.target;
+ const group = target && target.closest ? target.closest('[data-style-only][hidden]') : null;
+ if (!group) return;
+ restoreHiddenInvalid(group);
+ refreshFormGate(group.closest('form'));
+ });
  // Generic drag-reorder shared by the OSC Transmitters + OSC Destinations
  // row lists: same ⋮⋮ handle on both. Each row carries the bulk-reorder
  // endpoint + swap target in ``data-reorder-url`` / ``data-reorder-target``,

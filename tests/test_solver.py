@@ -13,11 +13,16 @@ import numpy as np
 import pytest
 
 from openfollow.scene.solver import (
+    CONE_RING_SEGMENTS,
     compute_homography,
+    cone_ring_angles,
+    cone_silhouette_angles,
     decompose_homography,
     ground_circle_world_ring,
     hfov_to_vfov,
     project_points,
+    ring_silhouette_edges,
+    ring_silhouette_indices,
     solve_camera_dlt,
     unproject_to_plane,
     vfov_to_hfov,
@@ -40,6 +45,114 @@ def test_ground_circle_world_ring_geometry() -> None:
 
 def test_ground_circle_world_ring_default_segment_count() -> None:
     assert len(ground_circle_world_ring(0.0, 0.0, 0.0, 1.0)) == 24
+    assert len(ground_circle_world_ring(0.0, 0.0, 0.0, 1.0, segments=CONE_RING_SEGMENTS)) == CONE_RING_SEGMENTS
+
+
+def _ellipse(cx: float, cy: float, rx: float, ry: float, n: int = 24) -> np.ndarray:
+    ang = np.linspace(0.0, 2 * math.pi, n, endpoint=False)
+    return np.column_stack([cx + rx * np.cos(ang), cy + ry * np.sin(ang)])
+
+
+def _rotated_ellipse(cx: float, cy: float, rx: float, ry: float, tilt_deg: float, n: int = 24) -> np.ndarray:
+    ang = np.linspace(0.0, 2 * math.pi, n, endpoint=False)
+    x, y = rx * np.cos(ang), ry * np.sin(ang)
+    c, s_ = math.cos(math.radians(tilt_deg)), math.sin(math.radians(tilt_deg))
+    return np.column_stack([cx + x * c - y * s_, cy + x * s_ + y * c])
+
+
+def _supports(edge: tuple[tuple[float, float], tuple[float, float]], pts: np.ndarray) -> bool:
+    """True when every point of ``pts`` lies on one side of the edge's line."""
+    (x0, y0), (x1, y1) = edge
+    cross = (x1 - x0) * (pts[:, 1] - y0) - (y1 - y0) * (pts[:, 0] - x0)
+    return bool(np.all(cross >= -1e-6) or np.all(cross <= 1e-6))
+
+
+class TestRingSilhouetteEdges:
+    """The two edges are the common tangents of the projected rings: each is a
+    supporting line of both rings, one per side, from a floor point to a top
+    point."""
+
+    def _check(self, floor: np.ndarray, top: np.ndarray, fc: tuple[float, float], tc: tuple[float, float]) -> list:
+        edges = ring_silhouette_edges(floor, top, fc, tc)
+        assert len(edges) == 2
+        both = np.vstack([floor, top])
+        for f, t in edges:
+            assert any(np.allclose(f, pt) for pt in floor)
+            assert any(np.allclose(t, pt) for pt in top)
+            assert _supports((f, t), both)
+        # The index form names the same points, so a caller can walk the rings.
+        pairs = ring_silhouette_indices(floor, top, fc, tc)
+        assert [(tuple(floor[i]), tuple(top[j])) for i, j in pairs] == [(f, t) for f, t in edges]
+        return edges
+
+    def test_front_view_joins_the_outer_points(self) -> None:
+        # Seen from the front: a wide base ellipse low on screen, a narrower
+        # top ellipse above it. The tangents leave from the outer flanks.
+        floor = _ellipse(400.0, 600.0, 50.0, 10.0)
+        top = _ellipse(400.0, 300.0, 30.0, 6.0)
+        edges = self._check(floor, top, (400.0, 600.0), (400.0, 300.0))
+        left, right = sorted(edges, key=lambda e: e[0][0])
+        assert left[0][0] < 400.0 and left[1][0] < 400.0
+        assert right[0][0] > 400.0 and right[1][0] > 400.0
+
+    def test_off_axis_tilted_ellipses_get_true_tangents(self) -> None:
+        # A marker far off the optical axis under a steep pitch: perspective
+        # tilts the two ellipses differently, so the outermost point along
+        # the perpendicular to the axis is not the tangent point. The edge
+        # must still support both rings instead of cutting into one.
+        floor = _rotated_ellipse(900.0, 700.0, 80.0, 22.0, 28.0)
+        top = _rotated_ellipse(820.0, 380.0, 45.0, 11.0, 18.0)
+        self._check(floor, top, (900.0, 700.0), (820.0, 380.0))
+
+    def test_sides_follow_a_tilted_axis(self) -> None:
+        # Roll the camera 90 degrees: the axis runs along screen X.
+        floor = _ellipse(600.0, 400.0, 10.0, 50.0)
+        top = _ellipse(300.0, 400.0, 6.0, 30.0)
+        edges = self._check(floor, top, (600.0, 400.0), (300.0, 400.0))
+        ys = sorted(f[1] for f, _ in edges)
+        assert ys[0] < 400.0 < ys[1]
+
+    def test_apex_gets_the_two_tangents_from_the_base(self) -> None:
+        # A top radius of zero: both edges end at the apex and support the base.
+        floor = _ellipse(400.0, 600.0, 50.0, 10.0)
+        apex = np.array([[430.0, 250.0]])
+        edges = self._check(floor, apex, (400.0, 600.0), (430.0, 250.0))
+        assert all(t == (430.0, 250.0) for _, t in edges)
+
+    def test_top_ring_inside_the_base_falls_back_to_the_axis_split(self) -> None:
+        # Seen from above the top ring sits inside the base ring: the hull
+        # has no bridge, so the outermost point per side is joined instead.
+        floor = _ellipse(400.0, 400.0, 50.0, 50.0)
+        top = _ellipse(410.0, 395.0, 10.0, 10.0)
+        edges = ring_silhouette_edges(floor, top, (400.0, 400.0), (410.0, 395.0))
+        assert len(edges) == 2
+        for f, t in edges:
+            assert any(np.allclose(f, pt) for pt in floor)
+            assert any(np.allclose(t, pt) for pt in top)
+
+    def test_identical_rings_still_return_two_edges(self) -> None:
+        # Both centres coincide and both rings are the same: the fallback
+        # split is horizontal so the call stays total.
+        ring = _ellipse(400.0, 400.0, 20.0, 20.0)
+        edges = ring_silhouette_edges(ring, ring, (400.0, 400.0), (400.0, 400.0))
+        assert len(edges) == 2
+        xs = sorted(f[0] for f, _ in edges)
+        assert xs == [pytest.approx(380.0), pytest.approx(420.0)]
+
+    @pytest.mark.parametrize("empty_floor", [True, False])
+    def test_an_empty_ring_yields_no_edges(self, empty_floor: bool) -> None:
+        ring = _ellipse(400.0, 400.0, 20.0, 20.0)
+        none = np.zeros((0, 2))
+        floor, top = (none, ring) if empty_floor else (ring, none)
+        assert ring_silhouette_edges(floor, top, (400.0, 400.0), (400.0, 300.0)) == []
+        assert ring_silhouette_indices(floor, top, (400.0, 400.0), (400.0, 300.0)) == []
+
+    def test_partial_rings_use_the_points_that_remain(self) -> None:
+        # Half the floor ring went behind the camera; the edges come from what
+        # is left rather than vanishing with the ring.
+        floor = _ellipse(400.0, 600.0, 50.0, 10.0)[:12]
+        top = _ellipse(400.0, 300.0, 30.0, 6.0)
+        self._check(floor, top, (400.0, 600.0), (400.0, 300.0))
 
 
 def _world_corners() -> np.ndarray:
@@ -623,3 +736,100 @@ class TestSolveAtNonZeroYaw:
         screen = project_points(params, world, canvas_w, canvas_h)
 
         assert solve_camera_dlt(self._GRID, [tuple(pt) for pt in screen], canvas_w, canvas_h) is None
+
+
+# ---------------------------------------------------------------------------
+# cone_silhouette_angles / cone_ring_angles
+# ---------------------------------------------------------------------------
+
+_CAMERA = np.array([0.0, -11.0, 6.0, -22.0, 0.0, 0.0, 60.0])
+
+
+def _frustum_on_screen(
+    cam: np.ndarray, centre: tuple[float, float], z0: float, z1: float, r0: float, r1: float, angles: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    def ring(z: float, r: float) -> np.ndarray:
+        world = np.column_stack(
+            [centre[0] + r * np.cos(angles), centre[1] + r * np.sin(angles), np.full(len(angles), z)]
+        )
+        return project_points(cam, world, 1920.0, 1080.0)
+
+    return ring(z0, r0), ring(z1, r1)
+
+
+class TestConeSilhouetteAngles:
+    def test_each_edge_touches_both_rings_without_cutting_into_either(self) -> None:
+        """The silhouette edge is a common tangent: every point of both rings lies on one side of it."""
+        centre, z0, z1, r0, r1 = (1.0, 2.5), 0.0, 1.8, 0.4, 0.15
+        silhouette = cone_silhouette_angles(_CAMERA, centre, z0, z1, r0, r1)
+        assert silhouette is not None
+        dense = np.linspace(0.0, math.tau, 3600, endpoint=False)
+        base, top = _frustum_on_screen(_CAMERA, centre, z0, z1, r0, r1, dense)
+        ends_base, ends_top = _frustum_on_screen(_CAMERA, centre, z0, z1, r0, r1, np.array(silhouette))
+        for (ax, ay), (bx, by) in zip(ends_base, ends_top, strict=True):
+            pts = np.vstack([base, top])
+            side = (bx - ax) * (pts[:, 1] - ay) - (by - ay) * (pts[:, 0] - ax)
+            reach = math.hypot(bx - ax, by - ay)
+            # Signed distance from the edge line, in pixels: all on one side, up to the dense sampling.
+            assert min(side.max(), -side.min()) / reach < 1e-3
+
+    def test_agrees_with_the_convex_hull_of_the_projected_rings(self) -> None:
+        """Across random cameras and cones the closed form picks the ring samples the hull bridges
+        between, to within one sample where a tangent falls halfway between two."""
+        rng = np.random.default_rng(7)
+        checked = 0
+        for _ in range(400):
+            cam = np.array(
+                [
+                    rng.uniform(-6, 6),
+                    rng.uniform(-12, -3),
+                    rng.uniform(1.5, 12),
+                    rng.uniform(-80, -5),
+                    rng.uniform(-40, 40),
+                    0.0,
+                    rng.uniform(30, 90),
+                ]
+            )
+            centre = (float(rng.uniform(-5, 5)), float(rng.uniform(-3, 3)))
+            r0 = float(rng.uniform(0.2, 1.2))
+            r1, z1 = float(rng.uniform(0.0, r0)), float(rng.uniform(0.6, 3.0))
+            silhouette = cone_silhouette_angles(cam, centre, 0.0, z1, r0, r1)
+            uniform = np.linspace(0.0, math.tau, CONE_RING_SEGMENTS, endpoint=False)
+            base, top = _frustum_on_screen(cam, centre, 0.0, z1, r0, r1, uniform)
+            if silhouette is None or not (np.all(np.isfinite(base)) and np.all(np.isfinite(top))):
+                continue
+            fc = tuple(project_points(cam, np.array([[*centre, 0.0]]), 1920.0, 1080.0)[0])
+            tc = tuple(project_points(cam, np.array([[*centre, z1]]), 1920.0, 1080.0)[0])
+            hull = sorted(i for i, _ in ring_silhouette_indices(base, top, fc, tc))
+            nearest = sorted(round(a / math.tau * CONE_RING_SEGMENTS) % CONE_RING_SEGMENTS for a in silhouette)
+            # Compare as sets on a circle: 0 and N - 1 are neighbours.
+            for a in nearest:
+                assert min(min(abs(a - b), CONE_RING_SEGMENTS - abs(a - b)) for b in hull) <= 1
+            checked += 1
+        assert checked > 300
+
+    @pytest.mark.parametrize(
+        ("camera", "z_top"),
+        [
+            (None, 1.8),  # no camera
+            (np.array([1.0, 2.5, 8.0, -89.0, 0.0, 0.0, 60.0]), 1.8),  # on the cone's axis
+            (_CAMERA, 0.0),  # no height
+            (np.array([1.2, 2.5, 9.0, -85.0, 0.0, 0.0, 60.0]), 1.8),  # looking into it from above
+        ],
+        ids=["no-camera", "on-axis", "no-height", "inside-its-view"],
+    )
+    def test_no_silhouette_where_the_rings_have_no_edge_between_them(self, camera, z_top: float) -> None:
+        assert cone_silhouette_angles(camera, (1.0, 2.5), 0.0, z_top, 0.4, 0.15) is None
+
+
+class TestConeRingAngles:
+    def test_without_a_silhouette_the_rings_are_evenly_sampled(self) -> None:
+        angles, at = cone_ring_angles(None)
+        np.testing.assert_allclose(angles, np.linspace(0.0, math.tau, CONE_RING_SEGMENTS, endpoint=False))
+        assert at == []
+
+    def test_the_silhouette_angles_join_the_samples_in_order(self) -> None:
+        angles, at = cone_ring_angles((5.0, 1.0))
+        assert len(angles) == CONE_RING_SEGMENTS + 2
+        assert np.all(np.diff(angles) >= 0)
+        assert [angles[i] for i in at] == [5.0, 1.0]

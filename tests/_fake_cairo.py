@@ -42,6 +42,11 @@ class TextDraw:
     rgba: tuple[float, ...]
 
 
+class _FakeTarget:
+    def get_device_scale(self) -> tuple[float, float]:
+        return (1.0, 1.0)
+
+
 class FakeCairo:
     """Recording Cairo context stand-in.
 
@@ -67,6 +72,7 @@ class FakeCairo:
         self.restores = 0
         self.translates: list[tuple[float, float]] = []
         self.scales: list[tuple[float, float]] = []
+        self.patterns: list[Any] = []
 
         self._cur_rgba: tuple[float, ...] = (0.0, 0.0, 0.0, 1.0)
         self._cur_x: float = 0.0
@@ -89,7 +95,17 @@ class FakeCairo:
         self._cur_rgba = (*args, 1.0)
         self.calls.append(("rgb", *args))
 
-    def set_source(self, _pattern: Any) -> None:
+    def set_source_surface(self, surface: Any, x: float = 0.0, y: float = 0.0) -> None:
+        self.calls.append(("source_surface", x, y))
+
+    def paint(self) -> None:
+        self.calls.append(("paint",))
+
+    def get_target(self) -> Any:
+        return _FakeTarget()
+
+    def set_source(self, pattern: Any) -> None:
+        self.patterns.append(pattern)
         self.calls.append(("source_pattern",))
 
     def set_line_width(self, w: float) -> None:

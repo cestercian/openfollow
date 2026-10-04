@@ -5,14 +5,24 @@
 from __future__ import annotations
 
 import math
-from typing import Any
+from collections.abc import Iterable
+from typing import Any, NamedTuple
 
+import cairo
 import numpy as np
 import numpy.typing as npt
 
 from openfollow.runtime.overlay_draw_style import parse_hex
 from openfollow.runtime.overlay_state import MarkerOverlayData, OverlayState
-from openfollow.scene.solver import apply_overlay_distortion, ground_circle_world_ring, project_points
+from openfollow.scene.solver import (
+    apply_overlay_distortion,
+    cone_ring_angles,
+    cone_silhouette_angles,
+    ground_circle_world_ring,
+    project_points,
+    ring_silhouette_indices,
+)
+from openfollow.zones.geometry import polygon_signed_area
 
 # Cap grid lines per axis. A degenerate width/depth ÷ spacing (e.g. from a
 # hand-edited config.toml or peer broadcast – neither has an upper clamp) would
@@ -220,6 +230,229 @@ def draw_detections(renderer: Any, cr: Any, state: OverlayState, w: int, h: int)
 # Alpha for the assist-mode ghost – dim so the AI-corrected PSN output reads as
 # secondary to the solid marker the operator steers.
 _GHOST_ALPHA = 0.5
+# Alpha of a cone's wireframe, matching the ground circle's outline.
+_CONE_ALPHA = 0.8
+# Line-width factor marking the selected marker in cone style, the
+# counterpart of the ball's radius bump.
+_CONE_SELECTED_SCALE = 1.5
+# Shaded side: how far the lit flank tints toward white and the far flank
+# toward black. The light sits to the screen left.
+_SHADE_LIGHT = 0.35
+_SHADE_DARK = 0.45
+
+
+def _side_gradient(
+    edges: list[tuple[tuple[float, float], tuple[float, float]]],
+    rgb: tuple[float, float, float],
+    alpha: float,
+) -> cairo.LinearGradient:
+    """Linear gradient across the side, from the left edge's midpoint (lit) to
+    the right edge's midpoint (shadow)."""
+    mids = sorted(((f[0] + t[0]) / 2.0, (f[1] + t[1]) / 2.0) for f, t in edges)
+    (x0, y0), (x1, y1) = mids
+    grad = cairo.LinearGradient(x0, y0, x1, y1)
+    r, g, b = rgb
+    lit = [c + (1.0 - c) * _SHADE_LIGHT for c in rgb]
+    shadow = [c * (1.0 - _SHADE_DARK) for c in rgb]
+    grad.add_color_stop_rgba(0.0, lit[0], lit[1], lit[2], alpha)
+    grad.add_color_stop_rgba(0.5, r, g, b, alpha)
+    grad.add_color_stop_rgba(1.0, shadow[0], shadow[1], shadow[2], alpha)
+    return grad
+
+
+def _path_ring(cr: Any, ring_scr: npt.NDArray[Any]) -> bool:
+    """Path a projected ring as a closed polygon; return whether it was pathed.
+
+    Keeps only finite points so one segment crossing behind the camera doesn't
+    erase the whole ring. The caller strokes or fills.
+    """
+    if len(ring_scr) < 3:
+        return False
+    cr.move_to(ring_scr[0, 0], ring_scr[0, 1])
+    for i in range(1, len(ring_scr)):
+        cr.line_to(ring_scr[i, 0], ring_scr[i, 1])
+    cr.close_path()
+    return True
+
+
+def _wound_same_way(poly: npt.NDArray[Any]) -> npt.NDArray[Any]:
+    """Return ``poly`` with a non-negative signed area, reversing it if needed.
+
+    Cairo's default fill rule is non-zero winding: sub-paths wound the same
+    way union into one evenly covered region, while an opposite winding
+    would punch a hole where they overlap.
+    """
+    if len(poly) < 3:  # nothing to wind; _path_ring skips it anyway
+        return poly
+    return poly[::-1] if polygon_signed_area(poly.tolist()) < 0 else poly
+
+
+class _ConeScreen(NamedTuple):
+    """A marker's cone on screen: finite ring points, projected centres, the
+    silhouette edges as ``(base index, top index)`` pairs, and each edge as a
+    polyline from its base point to its top point, bowed to match the lens."""
+
+    base_ring: npt.NDArray[Any]
+    top_ring: npt.NDArray[Any]
+    base_center: npt.NDArray[Any]
+    top_center: npt.NDArray[Any]
+    edges: list[tuple[int, int]]
+    edge_lines: list[npt.NDArray[Any]]
+
+
+def _cone_geometry(state: OverlayState, t: MarkerOverlayData, w: int, h: int) -> _ConeScreen:
+    """Project a marker's cone: the base ring on the stage plane, the top ring
+    at the marker's Z and the silhouette edges joining them.
+
+    The top ring follows Z wherever it is, below the stage plane included: the
+    cone is not symmetric, so a marker under the stage reads as pointing down.
+    """
+    tx, ty, tz = t.x, t.y, t.z
+    z_off = state.grid_config[5] if state.grid_config else 0.0
+    r_base, r_top = state.cone_base_diameter / 2.0, state.cone_top_diameter / 2.0
+    silhouette = cone_silhouette_angles(state.camera_params, (tx, ty), z_off, tz, r_base, r_top)
+    angles, at = cone_ring_angles(silhouette)
+    cos_a, sin_a = np.cos(angles), np.sin(angles)
+    n = len(angles)
+
+    # One projection per marker: both centres and both rings, split after.
+    world = np.empty((2 * n + 2, 3))
+    world[0] = (tx, ty, z_off)
+    world[1 : n + 1] = np.column_stack([tx + r_base * cos_a, ty + r_base * sin_a, np.full(n, z_off)])
+    world[n + 1] = (tx, ty, tz)
+    world[n + 2 :] = np.column_stack([tx + r_top * cos_a, ty + r_top * sin_a, np.full(n, tz)])
+    scr = project(state.camera_params, world, w, h, state.lens_k1, state.lens_k2)
+    base_center, base_ring = scr[0], scr[1 : n + 1]
+    top_center, top_ring = scr[n + 1], scr[n + 2 :]
+    base_world, top_world = world[1 : n + 1], world[n + 2 :]
+    edges: list[tuple[int, int]] = []
+    if at and np.all(np.isfinite(scr)):
+        # The rings share their angles, so each silhouette edge joins equal indices.
+        edges = [(i, i) for i in at]
+    else:
+        # No silhouette (seen from inside its view) or part of the cone behind the camera.
+        base_ok = np.all(np.isfinite(base_ring), axis=1)
+        top_ok = np.all(np.isfinite(top_ring), axis=1)
+        base_ring, base_world = base_ring[base_ok], base_world[base_ok]
+        top_ring, top_world = top_ring[top_ok], top_world[top_ok]
+        if np.all(np.isfinite(base_center)) and np.all(np.isfinite(top_center)):
+            edges = ring_silhouette_indices(
+                base_ring,
+                top_ring,
+                (float(base_center[0]), float(base_center[1])),
+                (float(top_center[0]), float(top_center[1])),
+            )
+    lines = [np.vstack([base_ring[i], top_ring[j]]) for i, j in edges]
+    if edges and (state.lens_k1 or state.lens_k2):
+        segments = [(base_world[i], top_world[j]) for i, j in edges]
+        bowed = _project_segments(
+            state.camera_params, segments, w, h, state.lens_k1, state.lens_k2, _DISTORTION_SUBDIVISIONS
+        )
+        lines = [line[np.all(np.isfinite(line), axis=1)] for line in bowed]
+    return _ConeScreen(base_ring, top_ring, base_center, top_center, edges, lines)
+
+
+def _ring_arc(ring: npt.NDArray[Any], start: int, end: int, toward: npt.NDArray[Any]) -> npt.NDArray[Any]:
+    """Points of ``ring`` from index ``start`` to ``end``, along whichever of
+    the two arcs lies on the ``toward`` side of the chord between them."""
+    n = len(ring)
+    forward = [(start + k) % n for k in range((end - start) % n + 1)]
+    backward = [(start - k) % n for k in range((start - end) % n + 1)]
+    cx, cy = ring[end] - ring[start]
+
+    def side(xs: npt.NDArray[Any], ys: npt.NDArray[Any]) -> float:
+        return float(np.sum(cx * (ys - ring[start, 1]) - cy * (xs - ring[start, 0])))
+
+    want = side(np.asarray([toward[0]]), np.asarray([toward[1]]))
+    fwd = ring[forward]
+    arc = forward if (side(fwd[:, 0], fwd[:, 1]) >= 0) == (want >= 0) else backward
+    return ring[arc]
+
+
+def _cone_side(g: _ConeScreen) -> npt.NDArray[Any] | None:
+    """The side of the cone as the region between the rings: from one tangent
+    point along the base ring's arc on the top's side to the other, up that
+    edge, back along the top ring's arc on the base's side, and down again.
+
+    Bounded by the ring arcs rather than their chords, it shares no area with
+    either disc while the discs are apart, so a translucent fill never doubles up and the only seams
+    fall on the ring outlines the wireframe strokes over.
+    """
+    if len(g.edges) != 2:
+        return None
+    (ia, ja), (ib, jb) = g.edges
+    up, down = g.edge_lines[1][1:-1], g.edge_lines[0][-2:0:-1]
+    base_arc = _ring_arc(g.base_ring, ia, ib, g.top_center)
+    top_arc = _ring_arc(g.top_ring, jb, ja, g.base_center)
+    return np.vstack([base_arc, up, top_arc, down])
+
+
+def _draw_cone(
+    cr: Any,
+    state: OverlayState,
+    t: MarkerOverlayData,
+    w: int,
+    h: int,
+    rgb: tuple[float, float, float],
+    alpha: float,
+    line_width: float,
+    fill_alpha: float = 0.0,
+    shaded: bool = False,
+    geometry: _ConeScreen | None = None,
+) -> None:
+    """Draw a truncated cone between the stage plane and the marker's Z.
+
+    A base ring at the marker's XY on the stage plane, a top ring at its Z and
+    the two silhouette edges joining them. A positive ``fill_alpha`` first
+    fills the silhouette (both discs and the side between them) as one evenly
+    covered region, or, when ``shaded``, the side under a left-lit gradient
+    between the two flat discs; the wireframe is stroked on top.
+    """
+    if not state.grid_config:
+        return
+    g = geometry if geometry is not None else _cone_geometry(state, t, w, h)
+    edges = [((float(ln[0, 0]), float(ln[0, 1])), (float(ln[-1, 0]), float(ln[-1, 1]))) for ln in g.edge_lines]
+    side = _cone_side(g)
+    r, g_, b = rgb
+
+    if fill_alpha > 0.0:
+        if shaded and side is not None:
+            # Base disc, lit side, lid: three passes so the side can carry
+            # its own gradient while the discs stay flat. Where the discs
+            # overlap, seen from above, the passes stack. A ring too
+            # degenerate to path leaves an empty path, and the fill is a no-op.
+            _path_ring(cr, g.base_ring)
+            cr.set_source_rgba(r, g_, b, fill_alpha)
+            cr.fill()
+            _path_ring(cr, side)
+            cr.set_source(_side_gradient(edges, rgb, fill_alpha))
+            cr.fill()
+            _path_ring(cr, g.top_ring)
+            cr.set_source_rgba(r, g_, b, fill_alpha)
+            cr.fill()
+        else:
+            regions = [g.base_ring, g.top_ring] + ([side] if side is not None else [])
+            filled = [_path_ring(cr, _wound_same_way(region)) for region in regions]
+            if any(filled):
+                cr.set_source_rgba(r, g_, b, fill_alpha)
+                cr.fill()
+
+    cr.save()
+    cr.set_source_rgba(r, g_, b, alpha)
+    cr.set_line_width(line_width)
+    # A miter where a ring seen almost edge-on turns sharply spikes past the ring.
+    cr.set_line_join(cairo.LINE_JOIN_ROUND)
+    drew = _path_ring(cr, g.base_ring)
+    if _path_ring(cr, g.top_ring):
+        drew = True
+    for line in g.edge_lines:
+        cr.move_to(line[0, 0], line[0, 1])
+        for x, y in line[1:]:
+            cr.line_to(x, y)
+        drew = True
+    if drew:
+        cr.stroke()
+    cr.restore()
 
 
 def _draw_assist_ghost(
@@ -251,20 +484,144 @@ def _draw_assist_ghost(
         z_off = state.grid_config[5]
         gc_pts = ground_circle_world_ring(tx, ty, z_off, state.ground_circle_size)
         gc_scr = project(cam, gc_pts, w, h, state.lens_k1, state.lens_k2)
-        gc_scr = gc_scr[np.all(np.isfinite(gc_scr), axis=1)]
-        if len(gc_scr) >= 3:
-            cr.move_to(gc_scr[0, 0], gc_scr[0, 1])
-            for i in range(1, len(gc_scr)):
-                cr.line_to(gc_scr[i, 0], gc_scr[i, 1])
-            cr.close_path()
+        if _path_ring(cr, gc_scr[np.all(np.isfinite(gc_scr), axis=1)]):
             cr.set_source_rgba(r, g, b, _GHOST_ALPHA)
             cr.set_line_width(1.5)
             cr.stroke()
 
 
-def draw_marker(cr: Any, state: OverlayState, t: MarkerOverlayData, w: int, h: int) -> None:
+class ConeCache:
+    """Each marker's cone as a picture, drawn again only when something it depends on changed.
+
+    The Operator Screen redraws on every display refresh; a cone that has not
+    moved is then one paint instead of its geometry and three fills.
+    """
+
+    def __init__(self) -> None:
+        self._entries: dict[tuple[int, bool], tuple[tuple[Any, ...], cairo.ImageSurface, int, int]] = {}
+
+    @staticmethod
+    def _slot(t: MarkerOverlayData) -> tuple[int, bool]:
+        # An assist marker draws its anchor and its ghost under one marker id.
+        return t.marker_id, t.is_assist_ghost
+
+    def retain(self, markers: Iterable[MarkerOverlayData]) -> None:
+        """Forget the cones of markers no longer drawn."""
+        keep = {self._slot(t) for t in markers}
+        for slot in [s for s in self._entries if s not in keep]:
+            del self._entries[slot]
+
+    def draw(
+        self,
+        cr: Any,
+        state: OverlayState,
+        t: MarkerOverlayData,
+        w: int,
+        h: int,
+        rgb: tuple[float, float, float],
+        alpha: float,
+        line_width: float,
+        fill_alpha: float = 0.0,
+        shaded: bool = False,
+    ) -> None:
+        if not state.grid_config:
+            return
+        cam = state.camera_params
+        scale = cr.get_target().get_device_scale()
+        key = (
+            t.x,
+            t.y,
+            t.z,
+            None if cam is None else tuple(float(v) for v in cam),
+            state.lens_k1,
+            state.lens_k2,
+            tuple(state.grid_config),
+            state.cone_base_diameter,
+            state.cone_top_diameter,
+            rgb,
+            alpha,
+            line_width,
+            fill_alpha,
+            shaded,
+            w,
+            h,
+            scale,
+        )
+        slot = self._slot(t)
+        entry = self._entries.get(slot)
+        if entry is None or entry[0] != key:
+            entry = self._render(key, state, t, w, h, rgb, alpha, line_width, fill_alpha, shaded, scale)
+            if entry is None:
+                self._entries.pop(slot, None)
+                return
+            self._entries[slot] = entry
+        _, picture, x0, y0 = entry
+        cr.set_source_surface(picture, x0, y0)
+        cr.paint()
+
+    @staticmethod
+    def _render(
+        key: tuple[Any, ...],
+        state: OverlayState,
+        t: MarkerOverlayData,
+        w: int,
+        h: int,
+        rgb: tuple[float, float, float],
+        alpha: float,
+        line_width: float,
+        fill_alpha: float,
+        shaded: bool,
+        scale: tuple[float, float],
+    ) -> tuple[tuple[Any, ...], cairo.ImageSurface, int, int] | None:
+        g = _cone_geometry(state, t, w, h)
+        points = np.vstack([g.base_ring, g.top_ring, *g.edge_lines])
+        if len(points) == 0:
+            return None
+        # With round joins the stroke reaches half its width past the rings and edges,
+        # anti-aliasing one pixel more; nothing beyond the frame is ever shown.
+        pad = int(math.ceil(line_width / 2.0)) + 2
+        x0 = max(0, int(math.floor(points[:, 0].min())) - pad)
+        y0 = max(0, int(math.floor(points[:, 1].min())) - pad)
+        x1 = min(w, int(math.ceil(points[:, 0].max())) + pad)
+        y1 = min(h, int(math.ceil(points[:, 1].max())) + pad)
+        if x1 <= x0 or y1 <= y0:
+            return None
+        sx, sy = scale
+        # Drawn at the target's device scale, so a HiDPI screen gets a sharp cone.
+        picture = cairo.ImageSurface(cairo.FORMAT_ARGB32, math.ceil((x1 - x0) * sx), math.ceil((y1 - y0) * sy))
+        picture.set_device_scale(sx, sy)
+        ctx = cairo.Context(picture)
+        ctx.translate(-x0, -y0)
+        _draw_cone(ctx, state, t, w, h, rgb, alpha, line_width, fill_alpha, shaded, geometry=g)
+        return key, picture, x0, y0
+
+
+def draw_marker(
+    cr: Any,
+    state: OverlayState,
+    t: MarkerOverlayData,
+    w: int,
+    h: int,
+    cone_cache: ConeCache | None = None,
+) -> None:
     cam = state.camera_params
     tx, ty, tz = t.x, t.y, t.z
+    is_sel = t.marker_id == state.selected_id
+    r, g, b = parse_hex(t.color)
+
+    # The cone survives any one point projecting behind the camera, so it is
+    # not gated on the marker's own point the way the ball is.
+    if state.marker_style == "cone":
+        draw = _draw_cone if cone_cache is None else cone_cache.draw
+        if t.is_assist_ghost:
+            draw(cr, state, t, w, h, (r, g, b), _GHOST_ALPHA, max(1.0, state.cone_thickness))
+            return
+        lw = float(state.cone_thickness)
+        if is_sel:
+            lw *= _CONE_SELECTED_SCALE
+        fill_alpha = state.cone_opacity if state.cone_filled else 0.0
+        draw(cr, state, t, w, h, (r, g, b), _CONE_ALPHA, lw, fill_alpha, state.cone_shaded)
+        return
 
     pts = [
         (tx, ty, tz),
@@ -275,8 +632,6 @@ def draw_marker(cr: Any, state: OverlayState, t: MarkerOverlayData, w: int, h: i
         return
 
     sx, sy = float(scr[0, 0]), float(scr[0, 1])
-    is_sel = t.marker_id == state.selected_id
-    r, g, b = parse_hex(t.color)
 
     if t.is_assist_ghost:
         _draw_assist_ghost(cr, state, t, w, h, (r, g, b))
@@ -325,14 +680,7 @@ def draw_marker(cr: Any, state: OverlayState, t: MarkerOverlayData, w: int, h: i
         z_off = state.grid_config[5]
         gc_pts = ground_circle_world_ring(tx, ty, z_off, state.ground_circle_size)
         gc_scr = project(cam, gc_pts, w, h, state.lens_k1, state.lens_k2)
-        # Keep only finite points so one segment crossing behind the camera
-        # doesn't erase the whole ground circle (matches the zone treatment).
-        gc_scr = gc_scr[np.all(np.isfinite(gc_scr), axis=1)]
-        if len(gc_scr) >= 3:
-            cr.move_to(gc_scr[0, 0], gc_scr[0, 1])
-            for i in range(1, len(gc_scr)):
-                cr.line_to(gc_scr[i, 0], gc_scr[i, 1])
-            cr.close_path()
+        if _path_ring(cr, gc_scr[np.all(np.isfinite(gc_scr), axis=1)]):
             if state.ground_circle_filled:
                 cr.set_source_rgba(r, g, b, 0.4)
                 cr.fill()

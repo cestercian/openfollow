@@ -7,16 +7,12 @@ from __future__ import annotations
 from typing import Any
 
 from openfollow.runtime.overlay_draw_style import (
-    COLOR_INFO_BG,
-    COLOR_INFO_BORDER,
-    COLOR_INFO_FILL,
     COLOR_TEXT,
-    COLOR_WARNING_BORDER,
-    COLOR_WARNING_FILL,
     PANEL_RADIUS,
-    draw_info_sign,
-    draw_rounded_rect,
-    draw_warning_sign,
+    STATUS_LEVELS,
+    draw_level_box,
+    draw_level_sign,
+    status_level,
 )
 from openfollow.runtime.overlay_state import OverlayState
 
@@ -28,8 +24,8 @@ _TOP_OFFSET = 10 + 24 + 6
 
 # The stack sizes to its widest row, clamped: narrow enough that a single short
 # verdict ("Video: Unreachable") is not mostly empty box, wide enough that a row
-# stays readable, and capped so a long one truncates instead of crossing the
-# frame. Every row shares the width so the stack reads as one column.
+# stays readable, and capped so a long one wraps instead of crossing the frame.
+# Every row shares the width so the stack reads as one column.
 _BADGE_MIN_WIDTH = 132.0
 _BADGE_MAX_WIDTH = 280.0
 _ROW_HEIGHT = 22.0
@@ -38,6 +34,8 @@ _ICON_PAD = 8.0
 _TEXT_PAD = 28.0  # icon column reserved on the left
 # Font the rows are drawn in; measuring has to match or the fit is wrong.
 _ROW_FONT_SIZE = 10.0
+# A row wraps at a space onto a second line, this far below the first.
+_LINE_ADVANCE = 13.0
 
 
 def _badge_width(renderer: Any, cr: Any, messages: list[str]) -> float:
@@ -69,76 +67,52 @@ def draw_status_badge(
     cursor_y = float(_TOP_OFFSET)
 
     for _key, message, severity in visible:
-        _draw_warning_row(
-            renderer,
-            cr,
-            badge_x,
-            cursor_y,
-            badge_w,
-            _ROW_HEIGHT,
-            message,
-            severity,
-        )
-        cursor_y += _ROW_HEIGHT + _ROW_SPACING
+        cursor_y += _draw_status_row(renderer, cr, badge_x, cursor_y, badge_w, message, status_level(severity))
+        cursor_y += _ROW_SPACING
 
     if overflow > 0:
-        # Tail row reads as an error if any hidden row is one, else info –
-        # so a stack of pure-info rows doesn't sprout a stray red tail.
+        # The tail takes the gravest level among the rows it hides.
         hidden = state.status_flags[len(visible) :]
-        tail_severity = "error" if any(s == "error" for _, _, s in hidden) else "info"
-        _draw_warning_row(
-            renderer,
-            cr,
-            badge_x,
-            cursor_y,
-            badge_w,
-            _ROW_HEIGHT,
-            f"+{overflow} more",
-            tail_severity,
-        )
+        tail_level = min((status_level(s) for _, _, s in hidden), key=STATUS_LEVELS.index)
+        _draw_status_row(renderer, cr, badge_x, cursor_y, badge_w, f"+{overflow} more", tail_level)
 
 
-def _draw_warning_row(
+def wrap_lines(renderer: Any, cr: Any, message: str, max_w: float) -> list[str]:
+    """*message* on one line of *max_w*, or broken at a space onto two; only the second is cut to fit.
+
+    Measures in the current font. A single word wider than a line is cut, never split.
+    """
+    words = message.split()
+    first = ""
+    for index, word in enumerate(words):
+        candidate = f"{first} {word}" if first else word
+        if first and cr.text_extents(candidate).width > max_w:
+            rest = " ".join(words[index:])
+            return [renderer._truncate_text_to_width(cr, line, max_w) for line in (first, rest)]
+        first = candidate
+    return [renderer._truncate_text_to_width(cr, first, max_w)]
+
+
+def _draw_status_row(
     renderer: Any,
     cr: Any,
     x: float,
     y: float,
     w: float,
-    h: float,
     message: str,
-    severity: str = "error",
-) -> None:
-    """One badge row: background, severity glyph, message text.
+    level: str,
+) -> float:
+    """One badge row in its level's chip colours, led by the level's sign. Returns its height."""
+    renderer._set_ui_font(cr, _ROW_FONT_SIZE, bold=True)
+    lines = wrap_lines(renderer, cr, message, w - _TEXT_PAD - _ICON_PAD)
+    h = _ROW_HEIGHT + (len(lines) - 1) * _LINE_ADVANCE
+    draw_level_box(cr, level, x, y, w, h, radius=PANEL_RADIUS, line_width=1.6)
+    draw_level_sign(cr, level, x + _ICON_PAD + 6.0, y + h * 0.5)
 
-    ``"error"`` is the HUD's warning red with a warning sign, ``"info"`` the
-    info blue with an "i" sign. The overflow row reuses it.
-    """
-    info = severity == "info"
-    radius = PANEL_RADIUS
-    draw_rounded_rect(cr, x, y, w, h, radius)
-    if info:
-        cr.set_source_rgba(*COLOR_INFO_FILL)
-    else:
-        cr.set_source_rgba(*COLOR_WARNING_FILL)
-    cr.fill()
-    draw_rounded_rect(cr, x, y, w, h, radius)
-    cr.set_source_rgb(*(COLOR_INFO_BORDER if info else COLOR_WARNING_BORDER))
-    cr.set_line_width(1.6)
-    cr.stroke()
-
-    glyph_cx = x + _ICON_PAD + 6.0
-    glyph_cy = y + h * 0.5
-    if info:
-        draw_info_sign(cr, glyph_cx, glyph_cy, cut=COLOR_INFO_BG)
-    else:
-        draw_warning_sign(cr, glyph_cx, glyph_cy)
-
-    # Message text – bold, truncated.
     renderer._set_ui_font(cr, _ROW_FONT_SIZE, bold=True)
     cr.set_source_rgb(*COLOR_TEXT)
-    text_x = x + _TEXT_PAD
-    text_max_w = w - _TEXT_PAD - _ICON_PAD
-    truncated = renderer._truncate_text_to_width(cr, message, text_max_w)
-    # Baseline matches system stats panel baseline.
-    cr.move_to(text_x, y + h * 0.7)
-    cr.show_text(truncated)
+    for index, line in enumerate(lines):
+        # The first baseline matches the system stats panel's.
+        cr.move_to(x + _TEXT_PAD, y + _ROW_HEIGHT * 0.7 + index * _LINE_ADVANCE)
+        cr.show_text(line)
+    return h

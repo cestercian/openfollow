@@ -5,8 +5,9 @@
 The badge surfaces ``OverlayState.status_flags`` entries as rows. Empty
 list ⇒ nothing draws; non-empty ⇒ one row per active flag, with overflow
 rolled into a single "+N more" tail row to bound the on-screen footprint.
-Each entry carries a severity – ``"error"`` (warning red, warning sign) or
-``"info"`` (blue, the "i" sign).
+Each entry carries a status level, drawn in that level's chip colours: error
+(warning red, warning sign), caution and info (the "i" sign), success (the
+check).
 
 Driven against the project's :class:`FakeCairo` so the tests stay fast
 and don't need an actual Cairo surface.
@@ -17,10 +18,16 @@ from __future__ import annotations
 import pytest
 
 from openfollow.runtime.overlay_draw_style import (
+    COLOR_CAUTION_BG,
+    COLOR_CAUTION_BORDER,
+    COLOR_CAUTION_FILL,
     COLOR_DANGER_BG,
     COLOR_INFO_BG,
     COLOR_INFO_BORDER,
     COLOR_INFO_FILL,
+    COLOR_SUCCESS_BG,
+    COLOR_SUCCESS_BORDER,
+    COLOR_SUCCESS_FILL,
     COLOR_TEXT,
     COLOR_WARNING_BORDER,
     COLOR_WARNING_FILL,
@@ -30,11 +37,13 @@ from openfollow.runtime.overlay_state import OverlayState
 from openfollow.runtime.overlay_status_badge import (
     _BADGE_MAX_WIDTH,
     _BADGE_MIN_WIDTH,
+    _LINE_ADVANCE,
     _MAX_VISIBLE_ROWS,
     _ROW_HEIGHT,
     _ROW_SPACING,
     _TOP_OFFSET,
     draw_status_badge,
+    wrap_lines,
 )
 from tests._fake_cairo import FakeCairo, FakeRenderer
 
@@ -120,7 +129,7 @@ class TestSingleFlag:
         kinds = [c[0] for c in cr.calls]
         triangle = kinds.index("rgb", kinds.index("line_join"))
         assert cr.calls[triangle][1:] == COLOR_TEXT
-        assert cr.fill_preserves == 1
+        assert ("fill_preserve",) in cr.calls[triangle:]
         assert ("rgb", *COLOR_DANGER_BG) in cr.calls
         assert cr.rects, "the '!' bar"
         assert cr.saves == cr.restores == 1
@@ -136,7 +145,7 @@ class TestSeverity:
         assert ("rgba", *COLOR_INFO_FILL) in cr.calls
         assert ("rgb", *COLOR_INFO_BORDER) in cr.calls
         assert ("rgb", *COLOR_INFO_BG) in cr.calls
-        assert cr.fill_preserves == 0, "no warning triangle"
+        assert ("rgb", *COLOR_DANGER_BG) not in cr.calls, "no warning sign"
         # No warning red anywhere on a pure-info badge.
         assert ("rgb", *COLOR_WARNING_BORDER) not in cr.calls
         assert ("rgba", *COLOR_WARNING_FILL) not in cr.calls
@@ -148,6 +157,42 @@ class TestSeverity:
         assert ("rgb", *COLOR_WARNING_BORDER) in cr.calls
         assert ("rgb", *COLOR_INFO_BORDER) not in cr.calls
         assert ("rgba", *COLOR_INFO_FILL) not in cr.calls
+
+    def test_a_caution_row_takes_the_caution_chip_and_the_i_sign(self) -> None:
+        cr = FakeCairo()
+        state = _state_with_flags(("pin", "Something limited", "caution"))
+        draw_status_badge(FakeRenderer(state=state), cr, state, 1920, 1080)
+        assert ("rgba", *COLOR_CAUTION_FILL) in cr.calls
+        assert ("rgb", *COLOR_CAUTION_BORDER) in cr.calls
+        # The "i" cut out of the off-white disc in the caution colour.
+        assert ("rgb", *COLOR_CAUTION_BG) in cr.calls
+        assert ("rgb", *COLOR_DANGER_BG) not in cr.calls, "no warning sign"
+        assert ("rgba", *COLOR_WARNING_FILL) not in cr.calls
+
+    def test_a_success_row_takes_the_success_chip_and_the_check(self) -> None:
+        cr = FakeCairo()
+        state = _state_with_flags(("diagnostics_export", "Diagnostics saved to Stick", "success"))
+        draw_status_badge(FakeRenderer(state=state), cr, state, 1920, 1080)
+        assert ("rgba", *COLOR_SUCCESS_FILL) in cr.calls
+        assert ("rgb", *COLOR_SUCCESS_BORDER) in cr.calls
+        # The check is cut out of an off-white disc, so it strokes in the success colour.
+        assert ("rgb", *COLOR_SUCCESS_BG) in cr.calls
+        assert ("rgb", *COLOR_INFO_BORDER) not in cr.calls
+        assert ("rgba", *COLOR_WARNING_FILL) not in cr.calls
+
+    @pytest.mark.parametrize(
+        "level",
+        ["warning", None, ["error"]],
+        ids=["unknown-name", "none", "unhashable"],
+    )
+    def test_a_level_nobody_defined_reads_as_an_error(self, level: object) -> None:
+        """A malformed writer must still show its row, and as a fault, not
+        vanish or take the whole draw pass down with it."""
+        cr = FakeCairo()
+        state = _state_with_flags(("odd", "Something", level))  # type: ignore[arg-type]
+        draw_status_badge(FakeRenderer(state=state), cr, state, 1920, 1080)
+        assert ("rgba", *COLOR_WARNING_FILL) in cr.calls
+        assert ("rgb", *COLOR_WARNING_BORDER) in cr.calls
 
 
 class TestMultipleFlags:
@@ -202,6 +247,27 @@ class TestOverflow:
         draw_status_badge(FakeRenderer(state=state), cr, state, 1920, 1080)
         # Pure-info stack incl. the tail never sets the warning red.
         assert ("rgb", *COLOR_WARNING_BORDER) not in cr.calls
+
+    @pytest.mark.parametrize(
+        ("hidden", "fill"),
+        [
+            (["info", "error", "caution"], COLOR_WARNING_FILL),
+            (["info", "caution", "success"], COLOR_CAUTION_FILL),
+            (["success", "info"], COLOR_INFO_FILL),
+            (["success", "success"], COLOR_SUCCESS_FILL),
+            (["success", ["info"]], COLOR_WARNING_FILL),
+        ],
+        ids=["error-first", "then-caution", "then-info", "success-only", "malformed-is-an-error"],
+    )
+    def test_the_tail_takes_the_gravest_level_it_hides(self, hidden: list[object], fill: tuple[float, ...]) -> None:
+        visible = [(f"v{i}", f"visible {i}", "success") for i in range(_MAX_VISIBLE_ROWS)]
+        tail = [(f"h{i}", f"hidden {i}", level) for i, level in enumerate(hidden)]
+        state = _state_with_flags(*visible, *tail)
+        cr = FakeCairo()
+        draw_status_badge(FakeRenderer(state=state), cr, state, 1920, 1080)
+        fills = [c[1:] for c in cr.calls if c[0] == "rgba"]
+        # The tail is the last row drawn; its fill is the last row fill set.
+        assert fills[-1] == fill
 
     def test_no_overflow_when_count_equals_cap(self) -> None:
         cr = FakeCairo()
@@ -276,3 +342,77 @@ class TestTheStackFitsItsContent:
         rows = [(f"k{i}", "short") for i in range(_MAX_VISIBLE_ROWS + 3)]
         _cr, width = self._render(*rows)
         assert width >= _BADGE_MIN_WIDTH
+
+
+class TestRowsWrapToTwoLines:
+    """Every row, whatever wrote it, wraps at a space onto a second line and is
+    cut only past that. A label and an interface name ("OTP output: Lighting
+    backup (enx00e04c68a1f2) is not connected") cut off the part that says what
+    is wrong when a row had one line."""
+
+    _OUTAGE = "OTP output: Lighting backup (enx00e04c68a1f2) is not connected"
+
+    @staticmethod
+    def _render(*flags: tuple[str, ...]) -> FakeCairo:
+        cr = FakeCairo()
+        state = _state_with_flags(*flags)
+        draw_status_badge(FakeRenderer(state=state), cr, state, 1920, 1080)
+        return cr
+
+    def test_a_row_that_fits_stays_one_line(self) -> None:
+        cr = self._render(("video_failure", "Video: Unreachable"))
+        assert cr.show_text_strings() == ["Video: Unreachable"]
+
+    @pytest.mark.parametrize("level", ["error", "caution", "info", "success"])
+    def test_a_long_row_of_any_level_wraps_at_a_space(self, level: str) -> None:
+        cr = self._render(("network_down_0", self._OUTAGE, level))
+        first, second = cr.texts
+        assert f"{first.text} {second.text}" == self._OUTAGE
+        assert second.x == first.x
+        assert second.y == first.y + _LINE_ADVANCE
+
+    def test_only_past_the_second_line_is_cut(self) -> None:
+        message = "MIDI patch(es) without a connected device: " + ", ".join(f"Faders {n}" for n in range(12))
+        cr = self._render(("midi_patch_missing", message))
+        lines = cr.show_text_strings()
+        assert len(lines) == 2
+        assert message.startswith(lines[0])
+        assert lines[1].endswith("...")
+        assert lines[1] != message[len(lines[0]) :].strip()
+
+    def test_a_word_longer_than_a_line_is_cut_not_split(self) -> None:
+        cr = self._render(("x", "y" * 80))
+        (only,) = cr.show_text_strings()
+        assert only.endswith("...")
+        assert only.startswith("yyyy")
+
+    def test_an_overlong_first_word_is_cut_on_its_own_line(self) -> None:
+        cr = self._render(("x", "y" * 80 + " is down"))
+        first, second = cr.show_text_strings()
+        assert first.endswith("...")
+        assert second == "is down"
+
+    def test_a_wrapped_row_is_taller_and_pushes_the_next_one_down(self) -> None:
+        cr = self._render(("a", self._OUTAGE), ("b", "Video: Stalled"))
+        tops = _row_top_ys(cr, _badge_x(cr))
+        assert tops == [float(_TOP_OFFSET), _TOP_OFFSET + _ROW_HEIGHT + _LINE_ADVANCE + _ROW_SPACING]
+
+    def test_the_sign_sits_centred_on_a_two_line_row(self) -> None:
+        cr = self._render(("a", self._OUTAGE, "info"))
+        # The info sign is a circle centred on the row.
+        centre_y = _TOP_OFFSET + (_ROW_HEIGHT + _LINE_ADVANCE) / 2
+        assert any(abs(arc[1] - centre_y) < 1e-6 for arc in cr.arcs)
+
+    def test_the_tail_stays_one_line(self) -> None:
+        rows = [(f"k{i}", self._OUTAGE) for i in range(_MAX_VISIBLE_ROWS + 1)]
+        cr = self._render(*rows)
+        assert cr.show_text_strings()[-1] == "+1 more"
+        assert len(cr.show_text_strings()) == 2 * _MAX_VISIBLE_ROWS + 1
+
+
+def test_wrapping_measures_in_the_current_font() -> None:
+    cr = FakeCairo()
+    cr.set_font_size(10.0)
+    # 6 px a character: twelve fit in 72 px.
+    assert wrap_lines(FakeRenderer(), cr, "aaaa bbbb cccc dddd", 72.0) == ["aaaa bbbb", "cccc dddd"]
+    assert wrap_lines(FakeRenderer(), cr, "", 72.0) == [""]

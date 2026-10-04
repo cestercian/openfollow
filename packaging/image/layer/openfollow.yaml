@@ -6,9 +6,11 @@
 # X-Env-Layer-Category: app
 # X-Env-Layer-Desc: Install the offline OpenFollow .deb and apply the headless
 #  appliance boot config (silent kiosk boot, HDMI 1080p, WiFi/BT off, SSH on).
-#  The .deb carries the runtime, the systemd units, the splash and the
-#  `openfollow` service user; this layer adds only the OS/boot concerns the .deb
-#  does not own. Requires rpi-user-credentials (creates the openfollow login user
+#  The .deb carries the runtime, the systemd units, the splash, the
+#  `openfollow` service user and its /etc files (the NetworkManager DHCP
+#  fallback, the USB adapter naming rule); this layer adds only the OS/boot
+#  concerns the .deb does not own, and never rewrites a file the .deb ships as a
+#  conffile, or dpkg sees it as modified and an update stops at its prompt. Requires rpi-user-credentials (creates the openfollow login user
 #  before the deb installs) and rpi-boot-firmware (so our config.txt/cmdline.txt
 #  edits run AFTER the firmware templates are installed, not before).
 #  The network stack is NetworkManager (installed + enabled below), not the

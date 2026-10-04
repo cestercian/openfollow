@@ -565,11 +565,13 @@ class OtpServer:
         priority: int = 100,
         *,
         mcast_ip: str | None = None,
+        source_iface: str = "",
     ) -> None:
         self._system_name = system_name
         self._system_number = system_number
         self._port = port
         self._source_ip = source_ip.strip()
+        self._source_iface = source_iface.strip()
         self._fps = fps
         self._priority = priority
 
@@ -678,6 +680,12 @@ class OtpServer:
         """True unless the test-only unicast/loopback branch is active."""
         return self._mcast_ip_override != ""
 
+    def bound_source_ip(self) -> str | None:
+        """Address this server is sending from, or ``None`` when stopped."""
+        if self._stop_event.is_set() or self._transform_thread is None:
+            return None
+        return self._source_ip
+
     def stop(self) -> None:
         """Signal threads to stop, wait for them, then close the socket."""
         self._stop_event.set()
@@ -712,6 +720,7 @@ class OtpServer:
         port: int,
         source_ip: str,
         priority: int,
+        source_iface: str = "",
     ) -> None:
         """Stop, reconfigure, and restart in place.
 
@@ -734,6 +743,7 @@ class OtpServer:
             self._system_number = system_number
             self._port = port
             self._source_ip = source_ip.strip()
+            self._source_iface = source_iface.strip()
             self._priority = priority
             # Recompute destinations for the new system_number.
             self._transform_dest, self._advertisement_dest = self._resolve_destinations()
@@ -786,7 +796,15 @@ class OtpServer:
         staging = contextlib.ExitStack()
         try:
             groups = self._multicast_groups()
-            if self._source_ip:
+            if self._source_iface:
+                # By name: selected by index, as PsnServer does.
+                sock = multicast_expert.McastTxSocket(
+                    socket.AF_INET,
+                    mcast_ips=groups,
+                    iface=self._source_iface,
+                    enable_external_loopback=True,
+                )
+            elif self._source_ip:
                 sock = multicast_expert.McastTxSocket(
                     socket.AF_INET,
                     mcast_ips=groups,

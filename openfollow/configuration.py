@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import copy
 import ipaddress
 import logging
 import math
@@ -27,6 +28,8 @@ except ImportError:
 import tomli_w
 
 from openfollow.binding_conflicts import BindingMove, settle_duplicates
+from openfollow.net_adapters import normalize_labels
+from openfollow.station_fqdn import normalize_fqdn
 from openfollow.units import UnitSystem
 
 if TYPE_CHECKING:
@@ -686,10 +689,17 @@ class OscConfig:
     # IPv4 multicast group the listener joins; empty = off. Validated to
     # 224.0.0.0–239.255.255.255, else coerced to "".
     multicast_group: str = "239.20.20.20"
+    # Interface, by name, that takes the multicast membership; empty follows the
+    # station interface, else the routing table picks one. The socket always binds
+    # every interface, so unicast and broadcast arrive regardless.
+    listen_iface: str = ""
 
     def __post_init__(self) -> None:
         """Normalize ``allowed_sender_ips`` (or a bare string) into ``list[str]``."""
         self.port = _coerce_int(self.port, 8765, lo=1, hi=65535)
+        if not isinstance(self.listen_iface, str):
+            self.listen_iface = ""
+        self.listen_iface = self.listen_iface.strip()
         raw = self.allowed_sender_ips
         if isinstance(raw, str):
             # A bare string becomes a single-entry list.
@@ -1075,6 +1085,8 @@ class RttrpmOutputConfig:
     port: int = 36700
     fps: int = 60
     context: int = 0
+    # Interface to send from, by name; blank follows ``psn_source_iface``.
+    source_iface: str = ""
 
     def __post_init__(self) -> None:
         # fps drives ``1.0 / fps`` in the send loop – clamp to >= 1 to avoid
@@ -1091,6 +1103,9 @@ class RttrpmOutputConfig:
         if not isinstance(self.host, str):
             self.host = "127.0.0.1"
         self.host = self.host.strip()
+        if not isinstance(self.source_iface, str):
+            self.source_iface = ""
+        self.source_iface = self.source_iface.strip()
 
 
 # ---------------------------------------------------------------------------
@@ -1566,6 +1581,8 @@ class OscDestinationConfig:
     # TCP framing selector. Inert for UDP but round-trippable so the UI swap
     # doesn't hide it on protocol toggle.
     framing: str = "slip"
+    # Interface to send from, by name; blank follows ``psn_source_iface``.
+    source_iface: str = ""
 
     def __post_init__(self) -> None:
         if not isinstance(self.id, str) or not self.id.strip():
@@ -1589,6 +1606,9 @@ class OscDestinationConfig:
             VALID_OSC_FRAMINGS,
             "slip",
         )
+        if not isinstance(self.source_iface, str):
+            self.source_iface = ""
+        self.source_iface = self.source_iface.strip()
 
 
 def _default_osc_destinations() -> list[OscDestinationConfig]:
@@ -1729,7 +1749,6 @@ VALID_MOVE_LAYOUTS = ("wasd", "ijkl", "numpad")
 
 _BUTTON_MAPPING_FIELDS = (
     "btn_reset",
-    "btn_source_select",
     "btn_toggle_help",
     "btn_toggle_zones",
     "btn_speed_down",
@@ -1854,7 +1873,6 @@ class ControllerConfig:
     curve: str = "logarithmic"
     # Normal mode button mappings
     btn_reset: str = "X"
-    btn_source_select: str = "BACK"
     btn_toggle_help: str = "Y"
     btn_speed_down: str = "LB"
     btn_speed_up: str = "RB"
@@ -2299,6 +2317,9 @@ class AppConfig:
     # so it recovers on its own after the source/network returns (0 = off).
     stall_timeout: float = 3.0
     heal_interval: float = 5.0
+    # Interface the network video inputs (SRT, RTSP, RTP) use, by name. Blank
+    # follows ``psn_source_iface``, like the outputs.
+    video_input_iface: str = ""
 
     # Window
     window_width: int = 1280
@@ -2320,6 +2341,17 @@ class AppConfig:
     # pins the bind; "0.0.0.0" forces all interfaces. The server always also
     # serves loopback so the on-screen browser keeps working.
     web_bind: str = ""
+    # Interface the web UI listens on. Blank = every interface. An explicit
+    # ``web_bind`` address outranks it. Unlike every other plane this one
+    # falls back to the wildcard bind when the pin cannot be resolved: a
+    # silent output is diagnosable, an unreachable config UI is not.
+    web_bind_iface: str = ""
+    # Operator labels for this station's interfaces, by interface name
+    # ("enx9c69d3ac16ab" -> "Lighting"). Device-local: they name this box's adapters.
+    interface_labels: dict[str, str] = field(default_factory=dict)
+    # This station's name on a venue's DNS. Blank = only its ``<host>.local`` name.
+    # Device-local: it names this box.
+    station_fqdn: str = ""
 
     # Web-triggered update settings (signed-.deb GitHub-release installer)
     update_github_repo: str = "openfollowapp/openfollow"
@@ -2393,6 +2425,14 @@ class AppConfig:
         if not isinstance(self.web_bind, str):
             self.web_bind = ""
         self.web_bind = self.web_bind.strip()
+        if not isinstance(self.web_bind_iface, str):
+            self.web_bind_iface = ""
+        self.web_bind_iface = self.web_bind_iface.strip()
+        if not isinstance(self.video_input_iface, str):
+            self.video_input_iface = ""
+        self.video_input_iface = self.video_input_iface.strip()
+        self.interface_labels = normalize_labels(self.interface_labels)
+        self.station_fqdn = normalize_fqdn(self.station_fqdn)
         # Strip ``psn_source_iface`` so whitespace doesn't look like a value
         # change each load and trigger a needless rebind cycle.
         if not isinstance(self.psn_source_iface, str):
@@ -2777,29 +2817,14 @@ def _warn_renamed_marker_key(old: str, new: str) -> None:
 def _warn_deprecated_controller_bindings(controller: ControllerConfig) -> None:
     """Emit a one-shot warning for deprecated controller bindings.
 
-    - The ``btn_source_select`` direct-entry shortcut was superseded by
-      the Settings menu (``btn_settings``).
-    - Mode-specific confirm/cancel pairs were consolidated into a single
-      ``btn_menu_confirm`` / ``btn_menu_cancel`` used by every menu.
+    Mode-specific confirm/cancel pairs were consolidated into a single
+    ``btn_menu_confirm`` / ``btn_menu_cancel`` used by every menu.
 
     ``load_config`` is invoked on every hot-reload, so a module-level set
     tracks which fields already warned to keep logs from flooding across
     reloads.
     """
     defaults = ControllerConfig()
-    direct_entry_fields = ("btn_source_select",)
-    for field_name in direct_entry_fields:
-        if field_name in _DEPRECATED_WARNED:
-            continue
-        current = getattr(controller, field_name)
-        if current != getattr(defaults, field_name):
-            logger.warning(
-                "Config field controller.%s=%r is deprecated: direct shortcut "
-                "removed – use the Settings menu (btn_settings, default BACK) instead.",
-                field_name,
-                current,
-            )
-            _DEPRECATED_WARNED.add(field_name)
     confirm_cancel_fields = (
         "btn_settings_confirm",
         "btn_settings_cancel",
@@ -2963,7 +2988,7 @@ def save_config(config: AppConfig, path: str = "config.toml") -> None:
 
 def _apply_with_fallback(
     name: str,
-    apply_fn: Callable[[], None],
+    apply_fn: Callable[[], object],
     *,
     on_failure: Callable[[], None] | None = None,
 ) -> bool:
@@ -3007,6 +3032,20 @@ def _marker_name_for_runtime(app: OpenFollowApp, marker_id: int) -> str:
     return f"Marker {marker_id}"
 
 
+def _video_config_changed(old_config: AppConfig, new_config: AppConfig) -> bool:
+    """Whether the video input must be rebuilt: plugin-driven via the active
+    source's ``config_changed(old, new)``, which covers ``video_source_type``,
+    per-plugin fields (rtsp_url, srt_host, …) and the station interface a blank
+    pin follows."""
+    from openfollow.video.inputs import get_input_class
+
+    if new_config.video_source_type != old_config.video_source_type:
+        return True
+    input_cls = get_input_class(new_config.video_source_type)
+    # None only for a hand-edited config.toml naming a removed plugin.
+    return input_cls is not None and input_cls.config_changed(old_config, new_config)
+
+
 def apply_runtime_config_changes(app: OpenFollowApp, new_config: AppConfig) -> bool:
     """Apply hot-reload config changes to runtime objects.
 
@@ -3026,7 +3065,7 @@ def apply_runtime_config_changes(app: OpenFollowApp, new_config: AppConfig) -> b
 
     def _apply(
         name: str,
-        apply_fn: Callable[[], None],
+        apply_fn: Callable[[], object],
         *,
         on_failure: Callable[[], None] | None = None,
     ) -> bool:
@@ -3058,21 +3097,31 @@ def apply_runtime_config_changes(app: OpenFollowApp, new_config: AppConfig) -> b
     # Strip whitespace before compare/store/apply: the web apply path bypasses
     # ``AppConfig.__post_init__``, so a value like ``"236.10.10.10 "`` would
     # otherwise spuriously rebind each load and break the multicast bind.
+    # A blank video pin follows the station interface; the video block below
+    # compares against the one that was in force here.
+    old_station_iface = app._config.psn_source_iface
+
     new_psn_mcast_ip = new_config.psn_mcast_ip.strip()
     new_psn_source_iface = new_config.psn_source_iface.strip()
     psn_iface_changed = new_psn_source_iface != app._config.psn_source_iface
     psn_mcast_changed = new_psn_mcast_ip != app._config.psn_mcast_ip
     if psn_iface_changed:
         # Resolve the bind IP up-front so receiver/server rebind to the same
-        # value ``init_psn`` uses. Fallback matches startup so clearing the pin
-        # still binds to a real interface instead of going dead.
-        from openfollow.net_utils import resolve_source_ip
+        # value ``init_psn`` uses – through the fail-closed resolver, because a
+        # configured interface with no address must stop PSN rather than move
+        # it. Falling through here would make a live Save behave differently
+        # from a reboot on the same config, and would put stage data on the
+        # network the operator just deselected.
+        from openfollow.net_utils import resolve_plane_source_ip
 
-        new_resolved_source_ip, _new_resolve_status = resolve_source_ip(
+        new_resolved_source_ip, new_resolve_status = resolve_plane_source_ip(
+            "",
             new_psn_source_iface,
         )
     else:
         new_resolved_source_ip = ""
+        new_resolve_status = "none"
+    psn_iface_down = psn_iface_changed and new_resolve_status == "down"
 
     if psn_mcast_changed and psn_iface_changed:
         old_psn_mcast_ip = app._config.psn_mcast_ip
@@ -3081,9 +3130,13 @@ def apply_runtime_config_changes(app: OpenFollowApp, new_config: AppConfig) -> b
         app._config.psn_source_iface = new_psn_source_iface
         if not _apply(
             "psn_network",
-            lambda: app._runtime_services.apply_psn_source_ip_change(
-                new_resolved_source_ip,
-                new_mcast_ip=new_psn_mcast_ip,
+            (
+                app._runtime_services.suspend_psn_planes
+                if psn_iface_down
+                else lambda: app._runtime_services.apply_psn_source_ip_change(
+                    new_resolved_source_ip,
+                    new_mcast_ip=new_psn_mcast_ip,
+                )
             ),
         ):
             app._config.psn_mcast_ip = old_psn_mcast_ip
@@ -3140,6 +3193,18 @@ def apply_runtime_config_changes(app: OpenFollowApp, new_config: AppConfig) -> b
     # looping on subsequent passes.
     if new_config.web_pin != app._config.web_pin:
         app._config.web_pin = new_config.web_pin
+    # Read live by the HUD's outage rows and the Network screen; nothing to rebind.
+    if new_config.interface_labels != app._config.interface_labels:
+        app._config.interface_labels = dict(new_config.interface_labels)
+    # Read live by the HUD's web address rows; the web server reads it from disk.
+    if new_config.station_fqdn != app._config.station_fqdn:
+        old_station_fqdn = app._config.station_fqdn
+        app._config.station_fqdn = new_config.station_fqdn
+        if not _apply(
+            "station_fqdn",
+            lambda: app._runtime_services.apply_station_fqdn_change(new_config.station_fqdn),
+        ):
+            app._config.station_fqdn = old_station_fqdn
 
     # PSN iface single-field path: only fires when iface changed alone (the
     # combined block above handles the iface+mcast case). The bind IP comes
@@ -3149,8 +3214,12 @@ def apply_runtime_config_changes(app: OpenFollowApp, new_config: AppConfig) -> b
         app._config.psn_source_iface = new_psn_source_iface
         if not _apply(
             "psn_source_iface",
-            lambda: app._runtime_services.apply_psn_source_ip_change(
-                new_resolved_source_ip,
+            (
+                app._runtime_services.suspend_psn_planes
+                if psn_iface_down
+                else lambda: app._runtime_services.apply_psn_source_ip_change(
+                    new_resolved_source_ip,
+                )
             ),
         ):
             app._config.psn_source_iface = old_psn_source_iface
@@ -3158,22 +3227,30 @@ def apply_runtime_config_changes(app: OpenFollowApp, new_config: AppConfig) -> b
         # now-active pin (cleared on a honoured pin, restored on rollback).
         app._refresh_psn_source_advisory()
 
-    # Video pipeline live-swap. Change detection is plugin-driven via the
-    # active source's ``config_changed(old, new)`` – covers ``video_source_type``
-    # and per-plugin fields (rtsp_url, srt_host, …). Distinct from the
+    # Planes with a blank pin follow the station interface, but each is gated
+    # on its own dataclass differing – which it doesn't when only the Station
+    # default row moved. Covers both iface paths above; the equality check
+    # skips it when either rolled back. Runs on the same pass, so the panel's
+    # address column never advertises an interface a plane isn't on yet.
+    if psn_iface_changed and app._config.psn_source_iface == new_psn_source_iface:
+        _apply(
+            "station_iface_followers",
+            app._runtime_services.apply_station_iface_change,
+        )
+
+    # Video pipeline live-swap, detected above. Distinct from the
     # ``detection`` block below.
     from openfollow.video.inputs import get_input_class
 
-    video_changed = new_config.video_source_type != app._config.video_source_type
-    if not video_changed:
-        input_cls = get_input_class(new_config.video_source_type)
-        # pragma: no branch – every video_source_type written via the
-        # web UI passes through the registry, so input_cls is always
-        # non-None at this point. The False arm guards against a
-        # hand-edited config.toml with a removed plugin.
-        if input_cls is not None:  # pragma: no branch
-            video_changed = input_cls.config_changed(app._config, new_config)
-    if video_changed:
+    # Built from the station interface actually committed above: a rejected
+    # station change must not pin the video to the interface it named.
+    video_config = copy.copy(new_config)
+    video_config.psn_source_iface = app._config.psn_source_iface
+    video_before = copy.copy(app._config)
+    video_before.psn_source_iface = old_station_iface
+    # A failed swap is owed until one succeeds: when only the station interface it
+    # follows changed, that change is committed and the configs alone no longer differ.
+    if _video_config_changed(video_before, video_config) or getattr(app, "_video_swap_owed", False):
         # Snapshot the new plugin's CURRENT (pre-commit) field values so the
         # failure path can restore them. The old plugin's fields aren't
         # snapshotted – the commit loop only writes new-plugin fields.
@@ -3201,10 +3278,12 @@ def apply_runtime_config_changes(app: OpenFollowApp, new_config: AppConfig) -> b
                     getattr(new_config, f.name, f.default),
                 )
 
-        if not _apply(
+        swapped = _apply(
             "video_source",
-            lambda: app._runtime_services.swap_video(new_config),
-        ):
+            lambda: app._runtime_services.swap_video(video_config),
+        )
+        app._video_swap_owed = not swapped
+        if not swapped:
             app._config.video_source_type = old_video_source_type
             for name, value in old_field_values.items():
                 setattr(app._config, name, value)
@@ -3383,6 +3462,7 @@ def apply_runtime_config_changes(app: OpenFollowApp, new_config: AppConfig) -> b
                 new_config.osc.port,
                 allowed_sender_ips=list(new_config.osc.allowed_sender_ips),
                 multicast_group=new_config.osc.multicast_group,
+                listen_iface=new_config.osc.listen_iface,
             )
 
     # ``enabled`` toggles the OSC ingest adapter; ``max_visible`` /

@@ -70,6 +70,7 @@ class PsnServer:
         port: int = DEFAULT_PORT,
         mcast_ip: str | None = DEFAULT_MCAST_IP,
         source_ip: str = "",
+        source_iface: str = "",
         data_fps: float = 60.0,
         info_fps: float = 1.0,
         clock: Callable[[], int] = psn_timestamp_usec,
@@ -79,6 +80,7 @@ class PsnServer:
         self._port = port
         self._mcast_ip = mcast_ip
         self._source_ip = source_ip.strip()
+        self._source_iface = source_iface.strip()
         self._data_fps = data_fps
         self._info_fps = info_fps
         self._clock = clock
@@ -149,6 +151,18 @@ class PsnServer:
         self._data_thread.start()
         self._info_thread.start()
 
+    def bound_source_ip(self) -> str | None:
+        """Address this server is sending from, or ``None`` when stopped.
+
+        Lets the network observer tell "already bound correctly" from "needs a
+        rebind" without tearing the socket down to find out - a rebind kills
+        the background retry thread that recovers a boot where the multicast
+        route came up late.
+        """
+        if self._stop_event.is_set() or self._data_thread is None:
+            return None
+        return self._source_ip
+
     def stop(self) -> None:
         """Signal threads to stop, wait for them, then close the socket."""
         self._stop_event.set()
@@ -184,11 +198,14 @@ class PsnServer:
         self,
         source_ip: str,
         *,
+        source_iface: str | _Unchanged = _UNCHANGED,
         mcast_ip: str | None | _Unchanged = _UNCHANGED,
     ) -> None:
         """Recreate multicast socket on new interface. Raises OSError on sync failure (live-apply requires signal)."""
         self.stop()
         self._source_ip = source_ip.strip()
+        if not isinstance(source_iface, _Unchanged):
+            self._source_iface = source_iface.strip()
         if not isinstance(mcast_ip, _Unchanged):
             if isinstance(mcast_ip, str):
                 mcast_ip = mcast_ip.strip()
@@ -234,7 +251,16 @@ class PsnServer:
         iface_ip = resolve_iface_ip(self._source_ip)
         staging = contextlib.ExitStack()
         try:
-            if iface_ip:
+            if self._source_iface:
+                # By name, multicast_expert selects the interface by index: an
+                # address another interface also holds cannot carry PSN there.
+                sock = multicast_expert.McastTxSocket(
+                    socket.AF_INET,
+                    mcast_ips=[mcast_ip],
+                    iface=self._source_iface,
+                    enable_external_loopback=True,
+                )
+            elif iface_ip:
                 sock = multicast_expert.McastTxSocket(
                     socket.AF_INET,
                     mcast_ips=[mcast_ip],

@@ -4,12 +4,14 @@
 
 from __future__ import annotations
 
+import re
 import subprocess
 
 import pytest
 
-from openfollow.network.adapter import Ipv4Config, Ipv4Method
+from openfollow.network.adapter import VLAN_UNSUPPORTED_MESSAGE, Ipv4Config, Ipv4Method
 from openfollow.network.dhcpcd_adapter import DhcpcdAdapter
+from openfollow.privilege.broker import PrivilegeError
 from tests._fake_broker import FakeBroker, make_failure, make_nonzero
 
 pytestmark = pytest.mark.unit
@@ -448,7 +450,8 @@ class TestApplyErrors:
         a = DhcpcdAdapter(conf_path=conf, broker=broker)
         result = a.apply_ipv4("eth0", Ipv4Config(method=Ipv4Method.DHCP))
         assert result.ok is False
-        assert "systemctl reload dhcpcd also failed" in result.message
+        assert "previous one was restored" in result.message
+        assert "reload boom" in result.message
 
     def test_release_partial_failure_is_warning(self, tmp_path) -> None:
         from openfollow.network.adapter import Ipv4Config, Ipv4Method
@@ -516,10 +519,12 @@ class TestApplyErrors:
         def boom():
             raise RuntimeError("read crashed")
 
-        a._read_conf = boom
+        a._read_conf_for_write = boom
         result = a.apply_ipv4("eth0", Ipv4Config(method=Ipv4Method.DHCP))
         assert result.ok is False
-        assert "Failed to update" in result.message
+        assert "Could not update" in result.message
+        # Says the interface was left alone, so the operator knows where they stand.
+        assert "nothing was changed" in result.message
 
 
 class TestRenewErrors:
@@ -564,7 +569,7 @@ class TestRenewErrors:
         broker = FakeBroker()
         a = DhcpcdAdapter(conf_path=DHCPCD_CONF, broker=broker)
         # Bypass the real /etc/dhcpcd.conf read – make it return empty.
-        a._read_conf = lambda: ""  # type: ignore[method-assign]
+        a._read_conf_for_write = lambda: ""  # type: ignore[method-assign]
         a._read_lease = lambda iface: None  # type: ignore[assignment,method-assign]
         result = a.apply_ipv4("eth0", Ipv4Config(method=Ipv4Method.DHCP))
         assert result.ok is True
@@ -596,7 +601,7 @@ class TestRenewErrors:
         broker = FakeBroker()
         broker.exceptions = [make_failure("write killed mid-stream")]  # tee step fails
         a = DhcpcdAdapter(conf_path=DHCPCD_CONF, broker=broker)
-        a._read_conf = lambda: "interface eth0\n# existing\n"  # type: ignore[method-assign]
+        a._read_conf_for_write = lambda: "interface eth0\n# existing\n"  # type: ignore[method-assign]
         result = a.apply_ipv4("eth0", Ipv4Config(method=Ipv4Method.DHCP))
         assert result.ok is False
         assert "write killed mid-stream" in result.message
@@ -614,7 +619,7 @@ class TestRenewErrors:
         broker = FakeBroker()
         broker.exceptions = [make_failure("operator cancelled")]
         a = DhcpcdAdapter(conf_path=DHCPCD_CONF, broker=broker)
-        a._read_conf = lambda: ""  # type: ignore[method-assign]
+        a._read_conf_for_write = lambda: ""  # type: ignore[method-assign]
         result = a.apply_ipv4("eth0", Ipv4Config(method=Ipv4Method.DHCP))
         assert result.ok is False
         assert "operator cancelled" in result.message
@@ -632,7 +637,8 @@ class TestRenewErrors:
         a = DhcpcdAdapter(conf_path=conf)  # broker omitted
         result = a.renew_lease("eth0")
         assert result.ok is False
-        assert "Broker" in result.message
+        # Names something the operator can act on, not an internal object.
+        assert "privileged helper is not configured" in result.message
 
 
 class TestBuildBlockBranches:
@@ -896,7 +902,7 @@ class TestApplyRollback:
         a = DhcpcdAdapter(conf_path=conf)  # no broker → bounce never happens
         result = a.apply_ipv4("eth0", Ipv4Config(method=Ipv4Method.DHCP))
         assert result.ok is False
-        assert "Broker not configured" in result.message
+        assert "privileged helper is not configured" in result.message
         assert conf.read_text() == original
 
     def test_rebounce_attempted_after_double_failure(self, tmp_path) -> None:
@@ -946,7 +952,8 @@ class TestApplyRollback:
         a = DhcpcdAdapter(conf_path=conf, broker=broker)
         result = a.apply_ipv4("eth0", Ipv4Config(method=Ipv4Method.DHCP))
         assert result.ok is False
-        assert "systemctl reload dhcpcd also failed" in result.message
+        assert "previous one was restored" in result.message
+        assert "reload boom" in result.message
 
     def test_restore_failure_is_logged_not_raised(self, tmp_path, caplog) -> None:
         from openfollow.network.adapter import Ipv4Config, Ipv4Method
@@ -1194,3 +1201,411 @@ class TestApplyBoundaryValidation:
         )
         assert result.ok is False
         assert conf.read_text() == ""  # nothing written
+
+
+class TestPendingOnADeadLink:
+    """``dhcpcd -n`` returns 0 on a carrier-less interface - it only signals the
+    daemon - so without an explicit pending state the apply reads as clean and
+    the web layer redirects the browser to an address nothing is serving."""
+
+    def test_apply_reports_pending_when_the_link_is_down(self, adapter, monkeypatch) -> None:
+        a, _conf = adapter
+        monkeypatch.setattr(a, "_has_carrier", lambda _iface: False)
+        result = a.apply_ipv4(
+            "eth0",
+            Ipv4Config(method=Ipv4Method.STATIC, address="192.168.9.9", prefix=24),
+        )
+        assert result.ok is True
+        assert result.pending is True
+        assert "has a link" in result.message
+
+    def test_apply_is_not_pending_with_a_link(self, adapter, monkeypatch) -> None:
+        a, _conf = adapter
+        monkeypatch.setattr(a, "_has_carrier", lambda _iface: True)
+        result = a.apply_ipv4(
+            "eth0",
+            Ipv4Config(method=Ipv4Method.STATIC, address="192.168.9.9", prefix=24),
+        )
+        assert result.ok is True
+        assert result.pending is False
+
+    def test_carrier_reads_the_kernel_operstate(self, adapter, tmp_path, monkeypatch) -> None:
+        a, _conf = adapter
+        import openfollow.network.dhcpcd_adapter as mod
+
+        class _Path:
+            def __init__(self, value: str) -> None:
+                self._value = value
+
+            def read_text(self, encoding: str = "utf-8") -> str:
+                return self._value
+
+        monkeypatch.setattr(mod, "Path", lambda _p: _Path("down\n"))
+        assert a._has_carrier("eth0") is False
+        monkeypatch.setattr(mod, "Path", lambda _p: _Path("up\n"))
+        assert a._has_carrier("eth0") is True
+
+    def test_an_unreadable_operstate_counts_as_having_carrier(self, adapter, monkeypatch) -> None:
+        """An apply we can't explain must never be downgraded to a reassuring
+        "saved, pending"."""
+        a, _conf = adapter
+        import openfollow.network.dhcpcd_adapter as mod
+
+        class _Missing:
+            def read_text(self, encoding: str = "utf-8") -> str:
+                raise OSError("no such file")
+
+        monkeypatch.setattr(mod, "Path", lambda _p: _Missing())
+        assert a._has_carrier("eth0") is True
+
+
+class TestMessagesFitTheOnScreenBanner:
+    """Every operator-facing message must be one sentence.
+
+    The on-screen Settings banner is a single truncated line, so a second
+    sentence is the half that gets cut - and it is reliably the actionable
+    half, because the first sentence says what broke and the second says what
+    to do about it. Asserting the shape here means a regression fails CI
+    rather than waiting for someone to read it on a device.
+    """
+
+    # ". " before a capital is the two-sentence signature. It cannot match a
+    # path like ``dhcpcd.conf`` or an address like ``192.168.1.5``, which is
+    # why the check is not simply "contains a period".
+    _SECOND_SENTENCE = re.compile(r"\.\s+[A-Z]")
+
+    def _messages(self, broker: FakeBroker, tmp_path) -> list[str]:
+        """Drive the failure paths and collect what the operator would see."""
+        out: list[str] = []
+        adapter = DhcpcdAdapter(conf_path=str(tmp_path / "dhcpcd.conf"), broker=broker)
+
+        out.append(adapter.apply_ipv4("bad iface!", Ipv4Config(method=Ipv4Method.DHCP)).message)
+
+        def _boom() -> str:
+            raise OSError("read crashed")
+
+        adapter._read_conf_for_write = _boom  # type: ignore[method-assign]
+        out.append(adapter.apply_ipv4("eth0", Ipv4Config(method=Ipv4Method.DHCP)).message)
+        return [m for m in out if m]
+
+    def test_no_message_carries_a_second_sentence(self, broker: FakeBroker, tmp_path) -> None:
+        offenders = [m for m in self._messages(broker, tmp_path) if self._SECOND_SENTENCE.search(m)]
+        assert offenders == [], f"multi-sentence operator messages: {offenders}"
+
+    def test_the_detector_would_catch_a_two_sentence_message(self) -> None:
+        """Guards the guard: a check that never matches proves nothing."""
+        assert self._SECOND_SENTENCE.search("Could not update the file. Nothing was changed.")
+        assert not self._SECOND_SENTENCE.search("Could not update /etc/dhcpcd.conf; nothing was changed.")
+        assert not self._SECOND_SENTENCE.search("Saved; eth0 is at 192.168.1.5 now.")
+
+
+class TestVlansUnsupported:
+    """dhcpcd configures addresses on links; it does not create them. The Pi
+    image masks systemd-networkd, so NetworkManager owns link creation."""
+
+    def test_reports_unsupported(self, broker: FakeBroker) -> None:
+        assert DhcpcdAdapter(broker=broker).supports_vlans() is False
+
+    def test_lists_nothing(self, broker: FakeBroker) -> None:
+        assert DhcpcdAdapter(broker=broker).list_vlans() == []
+
+    def test_create_refuses(self, broker: FakeBroker) -> None:
+        result = DhcpcdAdapter(broker=broker).create_vlan("eth0", 10)
+        assert result.ok is False
+        assert result.message == VLAN_UNSUPPORTED_MESSAGE
+        assert broker.calls == []
+
+    def test_delete_refuses(self, broker: FakeBroker) -> None:
+        result = DhcpcdAdapter(broker=broker).delete_vlan("eth0.10")
+        assert result.ok is False
+        assert result.message == VLAN_UNSUPPORTED_MESSAGE
+        assert broker.calls == []
+
+
+class TestSetDhcpFqdn:
+    """The name goes into one managed block of global options, ``hostname`` plus ``fqdn both``
+    (``hostname`` alone sends the whole name as option 12), and every interface rebinds so its
+    DHCP server sees it now."""
+
+    _FQDN = "of-1.stage.example.com"
+    _BLOCK = (
+        "# >>> openfollow managed: station fqdn >>>\n"
+        "hostname of-1.stage.example.com\n"
+        "fqdn both\n"
+        "# <<< openfollow managed: station fqdn <<<\n"
+    )
+
+    @pytest.fixture(autouse=True)
+    def _interfaces(self, monkeypatch):
+        from openfollow.network import psutil_adapter as pa
+        from openfollow.network.adapter import NetworkInterface
+
+        class FakePsutil:
+            def list_interfaces(self):
+                return [
+                    NetworkInterface(name="lo", mac=None, kind=None, is_up=True),
+                    NetworkInterface(name="eth0", mac=None, kind=None, is_up=True),
+                    NetworkInterface(name="wlan0", mac=None, kind=None, is_up=False),
+                ]
+
+        monkeypatch.setattr(pa, "PsutilReadOnlyAdapter", FakePsutil)
+
+    def test_the_name_closes_the_global_options_and_every_interface_rebinds(self, adapter, broker) -> None:
+        """Global options stop at the first section, and a block the station manages starts at its marker."""
+        a, conf = adapter
+        stock = (
+            "# stock\nhostname\nclientid\n\n"
+            "# >>> openfollow managed: eth0 >>>\ninterface eth0\n# <<< openfollow managed: eth0 <<<\n"
+        )
+        conf.write_text(stock)
+        result = a.set_dhcp_fqdn(self._FQDN)
+        assert (result.ok, result.partial_failures) == (True, ())
+        assert conf.read_text() == stock.replace(
+            "# >>> openfollow managed: eth0", self._BLOCK + "\n# >>> openfollow managed: eth0"
+        )
+        assert [call.argv for call in broker.calls] == [
+            ["/usr/sbin/dhcpcd", "-n", "eth0"],
+            ["/usr/sbin/dhcpcd", "-n", "wlan0"],
+        ]
+
+    def test_an_operator_section_keeps_its_place_after_the_name(self, adapter) -> None:
+        a, conf = adapter
+        conf.write_text("hostname\n\ninterface wlan0\nhostname mine.example.com\n")
+        a.set_dhcp_fqdn(self._FQDN)
+        assert conf.read_text() == "hostname\n\n" + self._BLOCK + "\ninterface wlan0\nhostname mine.example.com\n"
+
+    @pytest.mark.parametrize(
+        "original",
+        [
+            "# stock\nhostname\n\n"
+            "# >>> openfollow managed: eth0 >>>\ninterface eth0\n# <<< openfollow managed: eth0 <<<\n",
+            "hostname\n\ninterface wlan0\n",
+            "hostname\nclientid",
+            "",
+        ],
+        ids=["managed-section", "operator-section", "no-final-newline", "empty"],
+    )
+    def test_a_new_name_replaces_the_old_and_a_blank_one_gives_the_file_back(self, adapter, original: str) -> None:
+        a, conf = adapter
+        conf.write_text(original)
+        a.set_dhcp_fqdn(self._FQDN)
+        a.set_dhcp_fqdn("other.example.com")
+        text = conf.read_text()
+        assert text.count("openfollow managed: station fqdn >>>") == 1
+        assert "hostname other.example.com\n" in text and self._FQDN not in text
+        a.set_dhcp_fqdn("")
+        assert conf.read_text() == original + ("\n" if original and not original.endswith("\n") else "")
+
+    def test_an_orphaned_start_marker_is_replaced_not_duplicated(self, adapter) -> None:
+        """A hand edit that lost the end marker must not leave a second ``hostname`` behind."""
+        a, conf = adapter
+        conf.write_text(
+            "# >>> openfollow managed: station fqdn >>>\nhostname old.example.com\nfqdn both\ninterface eth0\n"
+        )
+        a.set_dhcp_fqdn(self._FQDN)
+        assert conf.read_text() == self._BLOCK + "\ninterface eth0\n"
+
+    def test_an_interface_that_fails_to_rebind_is_reported(self, adapter, broker) -> None:
+        a, _ = adapter
+        broker.exceptions = [make_failure("dhcpcd not running")]
+        result = a.set_dhcp_fqdn(self._FQDN)
+        assert result.ok
+        assert result.partial_failures == ("eth0 could not be reconnected (dhcpcd not running).",)
+
+    def test_a_conf_that_cannot_be_written_changes_nothing_else(self, adapter, broker, monkeypatch) -> None:
+        a, _ = adapter
+
+        def _refuse(text: str, **_kw) -> None:
+            raise OSError("read-only file system")
+
+        monkeypatch.setattr(a, "_write_conf_privileged", _refuse)
+        result = a.set_dhcp_fqdn(self._FQDN)
+        assert not result.ok
+        assert "is not mounted read-only (read-only file system)" in result.message
+        assert broker.calls == []
+
+    def test_a_refused_conf_write_is_reported(self, adapter, broker, monkeypatch) -> None:
+        a, _ = adapter
+
+        def _refuse(text: str, **_kw) -> None:
+            raise PrivilegeError("sudo: a password is required")
+
+        monkeypatch.setattr(a, "_write_conf_privileged", _refuse)
+        result = a.set_dhcp_fqdn(self._FQDN)
+        assert (result.ok, result.message) == (False, "sudo: a password is required")
+
+    def test_without_the_privileged_helper_nothing_rebinds(self, tmp_path) -> None:
+        conf = tmp_path / "dhcpcd.conf"
+        conf.write_text("hostname\n")
+        result = DhcpcdAdapter(conf_path=conf).set_dhcp_fqdn(self._FQDN)
+        assert not result.ok
+        assert "privileged helper is not configured" in result.message
+
+    @pytest.mark.parametrize("fqdn", ["of-2.stage.example.com", ""], ids=["renamed", "cleared"])
+    def test_a_block_missing_its_end_marker_takes_only_its_own_lines(self, adapter, fqdn: str) -> None:
+        """Truncated or hand-edited, the block's marker and its directives go; the global
+        options an operator wrote after it stay."""
+        a, conf = adapter
+        conf.write_text(
+            "# stock\n"
+            "# >>> openfollow managed: station fqdn >>>\n"
+            "hostname old.example.com\n"
+            "fqdn both\n"
+            "clientid\n"
+            "option ntp_servers\n"
+            "\n"
+            "interface eth0\n"
+        )
+        a.set_dhcp_fqdn(fqdn, reconnect=False)
+        text = conf.read_text()
+        assert "clientid\noption ntp_servers\n" in text
+        assert "old.example.com" not in text
+        assert text.count("openfollow managed: station fqdn >>>") == (1 if fqdn else 0)
+        assert text.endswith("interface eth0\n")
+
+    def test_an_unchanged_name_still_rebinds(self, adapter, broker) -> None:
+        """Saving the same name again is how an operator asks for it to be sent again."""
+        a, conf = adapter
+        conf.write_text(self._BLOCK)
+        a.set_dhcp_fqdn(self._FQDN)
+        assert conf.read_text() == self._BLOCK
+        assert len(broker.calls) == 2
+
+
+class TestSetDhcpFqdnInTheBackground:
+    _FQDN = "of-1.stage.example.com"
+
+    @pytest.fixture(autouse=True)
+    def _interfaces(self, monkeypatch):
+        from openfollow.network import psutil_adapter as pa
+        from openfollow.network.adapter import NetworkInterface
+
+        class FakePsutil:
+            def list_interfaces(self):
+                return [NetworkInterface(name="eth0", mac=None, kind=None, is_up=True)]
+
+        monkeypatch.setattr(pa, "PsutilReadOnlyAdapter", FakePsutil)
+
+    def test_it_never_asks_for_a_password(self, adapter, broker, monkeypatch) -> None:
+        a, conf = adapter
+        writes: list[bool] = []
+        monkeypatch.setattr(a, "_write_conf_privileged", lambda text, *, allow_prompt=True: writes.append(allow_prompt))
+        a.set_dhcp_fqdn(self._FQDN)
+        assert writes == [False]
+        assert [call.allow_prompt for call in broker.calls] == [False]
+
+    @pytest.mark.parametrize("write", ["fqdn", "fqdn-at-startup", "ipv4"])
+    def test_an_unreadable_conf_is_never_rewritten(self, tmp_path, broker, monkeypatch, write: str) -> None:
+        """Read as empty, it would be replaced by the managed blocks alone, at startup unasked."""
+        conf = tmp_path / "dhcpcd.conf"
+        conf.mkdir()
+        a = DhcpcdAdapter(conf_path=conf, broker=broker)
+        writes: list[str] = []
+        monkeypatch.setattr(a, "_write_conf_privileged", lambda text, **_kw: writes.append(text))
+        if write == "ipv4":
+            result = a.apply_ipv4("eth0", Ipv4Config(method=Ipv4Method.DHCP))
+        else:
+            result = a.set_dhcp_fqdn(self._FQDN, reconnect=write == "fqdn")
+        assert not result.ok
+        assert "nothing was changed" in result.message
+        assert (writes, broker.calls) == ([], [])
+
+    def test_a_missing_conf_gets_the_block_alone(self, tmp_path, broker, monkeypatch) -> None:
+        a = DhcpcdAdapter(conf_path=tmp_path / "dhcpcd.conf", broker=broker)
+        writes: list[str] = []
+        monkeypatch.setattr(a, "_write_conf_privileged", lambda text, **_kw: writes.append(text))
+        assert a.set_dhcp_fqdn(self._FQDN, reconnect=False).ok
+        assert writes == [TestSetDhcpFqdn._BLOCK]
+
+    def test_reconciling_writes_the_block_and_rebinds_nothing(self, adapter, broker) -> None:
+        a, conf = adapter
+        result = a.set_dhcp_fqdn(self._FQDN, reconnect=False)
+        assert (result.ok, result.message) == (True, "Applied.")
+        assert "hostname of-1.stage.example.com\nfqdn both\n" in conf.read_text()
+        assert broker.calls == []
+        assert a.set_dhcp_fqdn(self._FQDN, reconnect=False).message == "Unchanged."
+
+
+_STATIC_BLOCK = (
+    "# >>> openfollow managed: eth0 >>>\ninterface eth0\nstatic ip_address=198.51.100.5/24\n"
+    "# <<< openfollow managed: eth0 <<<\n"
+    "# >>> openfollow managed: eth2 >>>\ninterface eth2\ninform 203.0.113.9\n# <<< openfollow managed: eth2 <<<\n"
+)
+
+
+class TestReadAddressSources:
+    """The diagnostics read: where each address came from, or why it cannot say."""
+
+    @pytest.fixture
+    def station(self, tmp_path, monkeypatch):
+        from openfollow.network import psutil_adapter
+
+        names = ["lo", "eth0", "eth1", "eth2", "eth3"]
+        monkeypatch.setattr(psutil_adapter.psutil, "net_if_addrs", lambda: {n: [] for n in names})
+        monkeypatch.setattr(psutil_adapter.psutil, "net_if_stats", lambda: {})
+        conf = tmp_path / "dhcpcd.conf"
+        conf.write_text(_STATIC_BLOCK)
+        a = DhcpcdAdapter(conf_path=conf)
+        leases = {"eth1": "ip_address=192.0.2.10\nsubnet_cidr=24\n", "eth3": ""}
+        dumped: list[str] = []
+
+        def _run(argv, *, check=True):
+            dumped.append(argv[-1])
+            out = leases.get(argv[-1], "")
+            return subprocess.CompletedProcess(argv, 0 if out else 1, out, "")
+
+        a._run = _run  # type: ignore[method-assign]
+        return a, conf, dumped
+
+    def test_reads_the_method_from_the_conf_and_a_dhcp_address_from_the_lease(self, station) -> None:
+        from openfollow.network.adapter import AddressSourceReading
+
+        a, _conf, dumped = station
+        assert a.read_address_sources() == [
+            AddressSourceReading("eth0", "198.51.100.5", "static"),
+            AddressSourceReading("eth1", "192.0.2.10", "dhcp"),
+            AddressSourceReading("eth2", "203.0.113.9", "static"),
+            AddressSourceReading("eth3", "", "none"),
+        ]
+        # A configured address needs no lease to name it.
+        assert dumped == ["eth1", "eth3"]
+
+    def test_an_unreadable_conf_is_reported_where_the_panel_says_dhcp(self, station) -> None:
+        a, conf, _dumped = station
+        conf.unlink()
+        conf.mkdir()
+        readings = a.read_address_sources()
+        assert [(r.name, r.source) for r in readings] == [(n, "unreadable") for n in ("eth0", "eth1", "eth2", "eth3")]
+        assert all(r.reason == f"could not read {conf}: Is a directory" for r in readings)
+        state = a.get_state("eth0")
+        assert state is not None
+        assert state.ipv4.method == Ipv4Method.DHCP
+
+    @pytest.mark.parametrize("error", [FileNotFoundError("dhcpcd"), subprocess.TimeoutExpired(["dhcpcd"], 8)])
+    def test_a_lease_that_cannot_be_asked_for_is_reported_where_the_panel_shows_no_address(
+        self, station, error
+    ) -> None:
+        a, _conf, _dumped = station
+
+        def _run(argv, *, check=True):
+            raise error
+
+        a._run = _run  # type: ignore[method-assign]
+        sources = {r.name: (r.source, r.reason) for r in a.read_address_sources()}
+        assert sources["eth0"] == ("static", "")
+        assert sources["eth1"] == ("unreadable", str(error))
+        state = a.get_state("eth1")
+        assert state is not None
+        assert state.address_source == "none"
+
+    def test_an_interface_list_that_cannot_be_read_raises_where_the_panel_lists_nothing(
+        self, station, monkeypatch
+    ) -> None:
+        from openfollow.network import psutil_adapter
+        from openfollow.network.adapter import BackendReadError
+
+        a, _conf, _dumped = station
+        monkeypatch.setattr(psutil_adapter.psutil, "net_if_stats", lambda: 1 / 0)
+        with pytest.raises(BackendReadError, match="ZeroDivisionError"):
+            a.read_address_sources()
+        assert a.list_interfaces() == []

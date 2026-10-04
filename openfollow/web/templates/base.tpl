@@ -673,6 +673,8 @@
  }
  .row { display: flex; flex-wrap: wrap; gap: 0.72rem; margin-bottom: 0.72rem; }
  .row:last-child { margin-bottom: 0; }
+ /* Station Settings stacks two forms: the second's first row keeps the row gap the first's last one drops. */
+ #general-display-section { margin-top: 0.72rem; }
  /* The per-source fragment wrapper isn't the section's visual end – more rows
  (Stall Timeout, …) follow in the same group – so keep its last row's normal
  inter-row gap that .row:last-child would otherwise zero. */
@@ -832,6 +834,88 @@
  /* Full-width within its container (e.g. the login Unlock button). */
  .btn-block { width: 100%; }
  /* Network form: compact label:value grid matching the read-only status table. */
+ /* Interface Assignment: function -> interface rows, in the shared .data-table. */
+ .ia-assign tbody th[scope="row"] { font-weight: 600; white-space: nowrap; }
+ .ia-assign td:nth-child(2) { width: 46%; min-width: 220px; }
+ .ia-assign select { width: 100%; max-width: 22rem; margin: 0; }
+ .ia-addr { font-variant-numeric: tabular-nums; color: var(--muted); white-space: nowrap; }
+ .ia-readonly th[scope="row"] { font-weight: 500; }
+ /* Read-only pointer shown by each protocol section now that the pin itself
+ is edited centrally in Network Interface Assignment. Dashed border marks it as a
+ report rather than a control. */
+ .ia-pointer {
+ display: flex;
+ flex-direction: column;
+ gap: 0.2rem;
+ padding: 0.5rem 0.7rem;
+ border: 1px dashed var(--border);
+ border-radius: 10px;
+ background: var(--surface);
+ }
+ .ia-pointer-value { font-size: 0.86rem; }
+ /* Interface list: the status dot on each row's summary line. Up with an
+ address: the success state dot. No address: the plain grey dot. */
+ .ia-dot { display: inline-block; width: 0.55rem; height: 0.55rem; border-radius: 50%; background: var(--muted); vertical-align: middle; }
+ .ia-dot.up {
+ box-sizing: content-box; width: 10px; height: 10px; margin: -2.6px;
+ border: 2px solid var(--success-mark-muted); background: var(--success-mark); background-clip: content-box;
+ }
+ .ia-vlan-add {
+ margin-top: 0.8rem;
+ padding-top: 0.8rem;
+ border-top: 1px solid rgba(255, 255, 255, 0.08);
+ }
+ .ia-list-actions { display: flex; justify-content: flex-end; gap: 0.4rem; margin-top: 0.6rem; }
+ /* Interface rows: one collapsible row per NIC, carrying its own editor.
+    Same shape as an OSC transmitter row - the summary reads as a status
+    line, the body is the form. */
+ .net-iface-list { margin-bottom: 0.6rem; }
+ .net-iface-row { margin-bottom: 0.6rem; border: 1px solid var(--border-soft); border-radius: 0.6rem; padding: 0.5rem 0.8rem; background: var(--surface); }
+ .net-iface-summary { display: flex; gap: 0.6rem; align-items: center; cursor: pointer; padding-bottom: 0.2rem; }
+ .net-iface-row[open] { padding-bottom: 0.9rem; }
+ .net-iface-row[open] > .net-iface-form { margin-top: 0.9rem; }
+ /* Only the row being edited is accented - expanding a row to read it is not
+    a state worth marking, but the one row that will take a write is. */
+ .net-iface-row[data-mode="edit"] { border-color: var(--accent); }
+ /* A name, read like the station names: the UI font, not monospace. */
+ .net-iface-name { font-weight: 600; }
+ /* Label (or name) over the name and which adapter it is. */
+ .net-iface-ident { display: flex; flex-direction: column; min-width: 0; line-height: 1.25; }
+ .net-iface-sub { color: var(--muted); font-size: 0.76rem; overflow-wrap: anywhere; }
+ .net-iface-row[open] > .net-label-form { margin-top: 0.9rem; }
+ .net-iface-row[open] > .net-label-form + .net-iface-form { margin-top: 0; }
+ .net-label-input { max-width: 18rem; }
+ .net-label-input input { margin: 0; }
+ .net-iface-absent .net-iface-summary { cursor: default; padding-bottom: 0; }
+ .net-iface-absent .net-iface-name { color: var(--muted); }
+ .net-forget { margin: 0 0 0 auto; }
+ .net-iface-addr { color: var(--muted); font-size: 0.8rem; font-variant-numeric: tabular-nums; margin-left: auto; white-space: nowrap; }
+ /* How the address was come by: a neutral row pill, in the Controller Slots state's grey. */
+ .net-iface-method-badge {
+ flex: none; border-radius: 0.4rem; --pill-pad-y: 0.1rem; padding-inline: 0.45rem;
+ font-size: 0.7rem; font-weight: 500; white-space: nowrap;
+ color: rgba(247, 245, 233, 0.88); background: rgba(255, 255, 255, 0.05); border: 1px solid rgba(255, 255, 255, 0.18);
+ }
+ .net-iface-form .group:last-of-type { border-bottom: 0; }
+ /* Which addressing fields a method actually lets you set. View mode reads
+    them all out; only Edit mode hides the ones that don't apply. The JS
+    disables what it hides, so a hidden field never posts. */
+ .net-iface-row[data-mode="edit"][data-method="dhcp"] .net-addressing,
+ .net-iface-row[data-mode="edit"][data-method="dhcp_manual"] .net-static-only,
+ .net-iface-row[data-mode="edit"][data-method="static"] .net-dhcp-only { display: none; }
+ .ia-link {
+ color: var(--accent);
+ text-decoration: none;
+ font-size: 0.8rem;
+ }
+ .ia-link:hover { text-decoration: underline; }
+ @media (max-width: 720px) {
+ .ia-assign thead { display: none; }
+ .ia-assign, .ia-assign tbody, .ia-assign tr, .ia-assign th, .ia-assign td { display: block; width: 100%; }
+ .ia-assign tbody tr { border-bottom: 1px solid var(--border-soft); padding: 0.45rem 0; }
+ .ia-assign th, .ia-assign td { border-bottom: 0; padding: 0.2rem 0; }
+ .ia-assign td:nth-child(2) { width: 100%; }
+ }
  .network-grid {
  display: grid;
  grid-template-columns: minmax(7rem, 9rem) 1fr;
@@ -851,6 +935,9 @@
  color: rgba(247, 245, 233, 0.95);
  font-variant-numeric: tabular-nums;
  }
+ /* Renew sits on the value it acts on, so the line carries both. */
+ .net-lease-value { display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap; }
+ .net-lease-value button { margin: 0; }
  /* Disabled fields in the read-only view read as a clean status display
  rather than greyed-out broken inputs. */
  .network-config select:disabled, .network-config input:disabled {
@@ -1860,16 +1947,9 @@
  .network-state-card .group:last-child { padding-bottom: 0; margin-bottom: 0; }
  .network-state-card .muted { color: var(--muted); margin: 0; }
  /* Network result banner and disconnect warning. */
- .network-banner {
- margin-bottom: 0.8rem;
- padding: 0.5rem 0.7rem;
- border-left: 3px solid var(--accent);
- background: var(--accent-soft);
- font-size: 0.85rem;
- }
- /* Mode bar at the top of the network form: names the current mode and,
- in view mode, offers a text-link switch (not a button) so the unlock
- action doesn't read as a Save. */
+ /* The one banner the network card still carries: a station whose network
+ cannot be written from the web has to say so, or its disabled fields read
+ as a fault. */
  .net-mode-bar {
  display: flex;
  flex-wrap: wrap;
@@ -1881,7 +1961,6 @@
  background: rgba(247, 245, 233, 0.04);
  font-size: 0.82rem;
  }
- .net-mode-bar.edit { border-left-color: var(--accent); background: var(--accent-soft); }
  .net-mode-text { color: var(--muted); }
  .net-mode-pill {
  display: inline-flex;
@@ -1894,18 +1973,11 @@
  font-weight: 700;
  white-space: nowrap;
  }
- .net-mode-pill.view, .net-mode-pill.readonly {
+ .net-mode-pill.readonly {
  color: var(--muted);
  border: 1px solid var(--border);
  background: rgba(247, 245, 233, 0.05);
  }
- .net-mode-pill.edit {
- color: #ffe6a8;
- border: 1px solid var(--btn-secondary-border);
- background: var(--accent-soft);
- }
- /* Small gold-outline button (no fill, via .secondary .small), right-aligned. */
- .net-mode-switch { margin-left: auto; }
  /* Nested foldable sub-sections: tighter padding with subtle left
  border for visual nesting. Hit target inherits from .section-toggle. */
  .section.subsection {
@@ -2140,7 +2212,8 @@
  by the older class names; the level's sign sits in the left padding. Last in
  the block, so it wins over each class's layout-only rule above. */
  .notice, .update-notice, .restart-notice, .modal-error, .diag-error, .gallery-error,
- .wizard-action-required, .network-banner.network-banner-error, .network-banner.network-banner-ok {
+ .wizard-action-required, .network-banner.network-banner-error, .network-banner.network-banner-ok,
+ .network-banner.network-banner-info {
  position: relative;
  margin: 0 0 12px;
  padding: 10px 12px 10px 38px;
@@ -2154,7 +2227,7 @@
  }
  .notice::before, .update-notice::before, .restart-notice::before, .modal-error::before, .diag-error::before,
  .gallery-error::before, .wizard-action-required::before, .network-banner.network-banner-error::before,
- .network-banner.network-banner-ok::before {
+ .network-banner.network-banner-ok::before, .network-banner.network-banner-info::before {
  content: "";
  position: absolute;
  left: 12px;
@@ -2163,6 +2236,9 @@
  height: 16px;
  background: var(--info-sign) no-repeat center / contain;
  }
+ /* Progress: an info box led by the spinner in the sign's place. */
+ .network-banner.network-banner-busy::before { content: none; }
+ .network-banner-busy .modal-spinner { position: absolute; left: 12px; top: 11px; width: 16px; height: 16px; box-sizing: border-box; }
  .notice.error, .update-notice.error, .modal-error, .diag-error, .gallery-error, .network-banner.network-banner-error {
  border-color: var(--error-border);
  background: var(--error-fill);
@@ -2183,13 +2259,13 @@
  font-weight: 400; max-height: 8em; overflow: auto; white-space: pre-wrap; color: #cfd6df; }
  /* Pills set --pill-pad-y and their own inline padding. Trimming the line box to cap
  height and baseline centres the label whatever the fallback font's ascent. */
- .stat-chip, .diag-status-pill, .slot-state, .slot-note, .badge-experimental,
+ .stat-chip, .diag-status-pill, .slot-state, .slot-note, .badge-experimental, .net-iface-method-badge,
  .osc-binding-fault, .osc-binding-caution, .modal-list-item-badge, .update-flag, .osc-pill:not([data-invalid="true"]),
  .osc-pill[data-invalid="true"][data-unresolved="true"] {
  padding-block: var(--pill-pad-y);
  }
  @supports (text-box: trim-both cap alphabetic) {
- .stat-chip, .diag-status-pill, .slot-state, .slot-note, .badge-experimental,
+ .stat-chip, .diag-status-pill, .slot-state, .slot-note, .badge-experimental, .net-iface-method-badge,
  .osc-binding-fault, .osc-binding-caution, .modal-list-item-badge, .update-flag, .osc-pill:not([data-invalid="true"]),
  .osc-pill[data-invalid="true"][data-unresolved="true"] {
  text-box: trim-both cap alphabetic;
@@ -2280,6 +2356,22 @@
  <div class="help-drawer-body" id="help-drawer-body" tabindex="-1"></div>
  </aside>
  <script>
+ // The Network Interface card's poll re-renders every row, label fields included,
+ // so it waits while a label is edited but not saved, or a refused one is shown.
+ function netLabelsIdle() {
+ const edited = Array.from(document.querySelectorAll('.net-label-form input[name="label"]'))
+ .some((input) => input.value !== input.defaultValue);
+ return !edited && !document.querySelector('.net-label-form .field-error-msg');
+ }
+ // Network Interface Assignment's poll asks for this once the interface list reads
+ // differently: each picker reloads its options, keeping what it shows selected.
+ function refreshIfacePickers() {
+ document.querySelectorAll('select[data-options-url]').forEach((select) => {
+ const url = select.dataset.optionsUrl + '&current=' + encodeURIComponent(select.value);
+ htmx.ajax('GET', url, {source: select, target: select, swap: 'innerHTML'});
+ });
+ }
+ document.addEventListener('iface-options-changed', refreshIfacePickers);
  // Schedule client-side reload for static/manual address apply (single-NIC only).
  // On multi-NIC, HX-Redirect returns and unloads this page first, cancelling the timer.
  function netScheduleReload(el) {
@@ -2307,6 +2399,52 @@
  };
  form.addEventListener('htmx:afterRequest', cancel);
  }
+ // Which addressing fields the chosen method actually lets you set. CSS
+ // hides them off ``data-method``; this disables the hidden ones, because a
+ // hidden input still posts and a DHCP apply must not carry a stale static
+ // address. View-mode rows are disabled wholesale and are left alone.
+ function netSyncMethodFields(row) {
+ const sel = row.querySelector('.net-method-select');
+ if (!sel || row.dataset.mode !== 'edit') return;
+ row.dataset.method = sel.value;
+ const manual = sel.value === 'static' || sel.value === 'dhcp_manual';
+ row.querySelectorAll('.net-addressing input').forEach((el) => { el.disabled = !manual; });
+ row.querySelectorAll('.net-static-only').forEach((el) => {
+ if ('disabled' in el) el.disabled = sel.value !== 'static';
+ });
+ }
+ function initNetworkMethodFields(root) {
+ (root || document).querySelectorAll('.net-iface-row').forEach(netSyncMethodFields);
+ }
+ // Delegated so rows swapped in by a poll or an apply need no rebinding.
+ document.addEventListener('change', (evt) => {
+ const sel = evt.target.closest && evt.target.closest('.net-method-select');
+ if (!sel) return;
+ const row = sel.closest('.net-iface-row');
+ if (row) netSyncMethodFields(row);
+ });
+ // A request from an element with data-busy-text shows that text in the
+ // network card's busy box until it answers; {field} reads the form's field.
+ // Only the sending element counts, so Cancel inside a busy form stays quiet.
+ function netBusyText(elt) {
+ if (!elt || !elt.hasAttribute || !elt.hasAttribute('data-busy-text')) return null;
+ const form = elt.closest('form');
+ return elt.dataset.busyText.replace(/\{(\w+)\}/g, (_, name) => {
+ const field = form && form.elements[name];
+ return field ? field.value : '';
+ });
+ }
+ document.addEventListener('htmx:beforeRequest', (evt) => {
+ const text = netBusyText(evt.detail.elt);
+ const box = document.getElementById('net-busy');
+ if (text === null || !box) return;
+ box.querySelector('.net-busy-text').textContent = text;
+ box.hidden = false;
+ });
+ document.addEventListener('htmx:afterRequest', (evt) => {
+ const box = document.getElementById('net-busy');
+ if (box && netBusyText(evt.detail.elt) !== null) box.hidden = true;
+ });
 
  const sectionFoldStoragePrefix = 'psnfs:section:';
  const advancedFoldStoragePrefix = 'psnfs:advanced:';
@@ -2411,17 +2549,25 @@
  function initializeInlineAdvanced(root) {
  const scope = root || document;
  const detailsNodes = [];
- if (scope.matches && scope.matches('details.inline-advanced[data-adv-key]')) {
+ if (scope.matches && scope.matches('details[data-adv-key]')) {
  detailsNodes.push(scope);
  }
- scope.querySelectorAll('details.inline-advanced[data-adv-key]')
+ scope.querySelectorAll('details[data-adv-key]')
  .forEach((node) => detailsNodes.push(node));
  detailsNodes.forEach((node) => {
  const key = node.dataset.advKey;
  if (!key) return;
+ // A server-forced open outranks the remembered state: the row carries a
+ // result the operator has to see. Remembering it keeps the next poll's
+ // re-render from closing it again.
+ if (node.dataset.advForceOpen === '1') {
+ node.open = true;
+ writeStorage(getAdvancedFoldStorageKey(key), 'open');
+ } else {
  const stored = readStorage(getAdvancedFoldStorageKey(key));
  if (stored === 'open') node.open = true;
  else if (stored === 'closed') node.open = false;
+ }
  if (node.dataset.bound === '1') return;
  node.dataset.bound = '1';
  node.addEventListener('toggle', () => {
@@ -3562,7 +3708,9 @@
  // Scoped to actual form-submit / broadcast controls only.
  function refreshFormGate(form) {
  if (!form) return;
- const hasError = form.querySelector('[aria-invalid="true"]') !== null;
+ // ``form.elements`` also holds inputs joined to the form from outside it by ``form=``.
+ const hasError = form.querySelector('[aria-invalid="true"]') !== null
+ || Array.from(form.elements).some((el) => el.getAttribute('aria-invalid') === 'true');
  form.querySelectorAll(
  'button[type="submit"].save-btn,'
  + ' button.broadcast-btn[onclick*="broadcastSection"]'
@@ -3576,11 +3724,21 @@
  ).forEach((b) => { b.disabled = hasError; });
  }
  }
- document.body.addEventListener('htmx:afterSwap', (e) => {
- if (e.detail.target && e.detail.target.classList && e.detail.target.classList.contains('saved')) {
+ // After settling, not swapping: htmx swaps an element in wearing its predecessor's classes
+ // and only settles the response's own, so ``saved`` is not there yet at afterSwap.
+ document.body.addEventListener('htmx:afterSettle', (e) => {
+ // ``e.target`` is what was swapped in; after an outerHTML swap ``detail.target`` is the detached original.
+ const savedForm = [e.target, e.detail.target].find(
+ (el) => el && el.isConnected && el.classList && el.classList.contains('saved'));
+ if (!savedForm) return;
  showToast('Saved');
- setTimeout(() => e.detail.target.classList.remove('saved'), 500);
- }
+ // A form inside a shared box rings the box, the same box a failed save rings.
+ const ring = savedForm.closest('.save-flash, .section') || savedForm;
+ ring.classList.add('saved');
+ // Outlives the 0.55 s flash-green animation, or the ring jumps to its end.
+ setTimeout(() => { savedForm.classList.remove('saved'); ring.classList.remove('saved'); }, 600);
+ });
+ document.body.addEventListener('htmx:afterSwap', (e) => {
  // Validation swap: the target is a sibling ``<span class="field-error">``
  // whose inner content is either empty (valid), an error span (invalid),
  // or a note span (advisory). Flip ``aria-invalid`` on the input and
@@ -3591,8 +3749,20 @@
  if (input) {
  const hasError = target.querySelector('.field-error-msg') !== null;
  input.setAttribute('aria-invalid', hasError ? 'true' : 'false');
- refreshFormGate(input.closest('form'));
+ refreshFormGate(input.form || input.closest('form'));
  }
+ }
+ // A re-render carrying a value the server refused marks its input the
+ // way a failed blur check does.
+ if (target && target.querySelectorAll) {
+ target.querySelectorAll('.field-error').forEach((span) => {
+ const input = span.id && span.querySelector('.field-error-msg')
+ ? document.querySelector('[aria-describedby="' + span.id + '"]') : null;
+ if (input) {
+ input.setAttribute('aria-invalid', 'true');
+ refreshFormGate(input.form || input.closest('form'));
+ }
+ });
  }
  // Section re-renders (after a successful save) reset every input to
  // ``aria-invalid="false"`` already; just re-run the gate to clear
@@ -3608,6 +3778,7 @@
  }
  initializeSectionFolding(document);
  initializeInlineAdvanced(document);
+ initNetworkMethodFields(document);
  });
  // Periodic pollers (Live Statistics 1s, Diagnostics / Server overview 5s)
  // replace whole DOM subtrees. That destroys Firefox's scroll-anchor node,
@@ -3913,6 +4084,17 @@
  el.classList.toggle('active', el.id === 'tab-' + tabId);
  });
  writeStorage('psnfs:active-tab:' + location.pathname, tabId);
+ }
+ // Cross-tab pointer links. A bare href="#id" does nothing when the target
+ // sits in an inactive tab, because .tab-content is display:none - so switch
+ // to the owning tab first, then scroll once layout has settled.
+ function goToSection(tabId, targetId) {
+   switchTab(tabId);
+   var el = document.getElementById(targetId);
+   if (!el) { return; }
+   requestAnimationFrame(function () {
+     el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+   });
  }
  function initTabs() {
  var stored = readStorage('psnfs:active-tab:' + location.pathname);
@@ -4899,6 +5081,7 @@
  document.addEventListener('DOMContentLoaded', () => {
  initializeSectionFolding(document);
  initializeInlineAdvanced(document);
+ initNetworkMethodFields(document);
  initTabs();
  oscEditorInit(document);
  });

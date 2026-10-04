@@ -7,6 +7,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import Literal
 
 
 class Ipv4Method(str, Enum):
@@ -23,14 +24,14 @@ class NetworkInterface:
     is_up: bool
 
 
-_LOOPBACK_NAMES = frozenset({"lo", "lo0"})
+LOOPBACK_NAMES = frozenset({"lo", "lo0"})
 
 
 def is_loopback(iface: NetworkInterface) -> bool:
     """Return True if interface is loopback (matches kind or well-known names)."""
     if (iface.kind or "").lower() == "loopback":
         return True
-    return iface.name in _LOOPBACK_NAMES
+    return iface.name in LOOPBACK_NAMES
 
 
 @dataclass(frozen=True)
@@ -51,11 +52,65 @@ class LeaseInfo:
     lease_seconds_remaining: int | None
 
 
+AddressSource = Literal["dhcp", "static", "link-local", "none"]
+
+
+def address_source_of(address: str | None, method: Ipv4Method) -> AddressSource:
+    """Where an address configured with *method* came from.
+
+    Derived rather than stored so the backends can't disagree about it.
+    ``link-local`` outranks the configured method: NM's DHCP fallback hands out
+    a 169.254 address while the profile still reads ``auto``, and that address
+    is the thing an operator needs told about.
+    """
+    from openfollow.network.validate import is_link_local
+
+    if not address:
+        return "none"
+    if is_link_local(address):
+        return "link-local"
+    # DHCP-with-manual-address counts as static: the address the operator
+    # sees is the one they typed, not one a server handed out.
+    if method in (Ipv4Method.STATIC, Ipv4Method.DHCP_WITH_MANUAL_ADDRESS):
+        return "static"
+    return "dhcp"
+
+
+class BackendReadError(RuntimeError):
+    """A read of the network backend failed; the message names the read and why."""
+
+
+@dataclass(frozen=True)
+class AddressSourceReading:
+    """One interface's IPv4 address and where it came from, as the backend reports it now.
+
+    ``unknown``: the backend read fine but did not set this address, so it
+    cannot say. ``unreadable``: a backend read failed. Both carry ``reason``.
+    """
+
+    name: str
+    address: str = ""
+    source: AddressSource | Literal["unknown", "unreadable"] = "none"
+    reason: str = ""
+
+
 @dataclass(frozen=True)
 class NetworkState:
     interface: NetworkInterface
     ipv4: Ipv4Config
     lease: LeaseInfo | None
+
+    @property
+    def address_source(self) -> AddressSource:
+        """Where this interface's address came from, for operator display."""
+        return address_source_of(self.ipv4.address, self.ipv4.method)
+
+
+@dataclass(frozen=True)
+class VlanInterface:
+    name: str
+    parent: str
+    vlan_id: int
 
 
 @dataclass(frozen=True)
@@ -63,6 +118,19 @@ class ApplyResult:
     ok: bool
     message: str = ""
     partial_failures: tuple[str, ...] = field(default_factory=tuple)
+
+    pending: bool = False
+    """The settings were saved but the interface never came up.
+
+    Distinct from ``partial_failures``, which means "activated, with caveats".
+    Callers must not treat a pending apply as reachable: there is no address
+    serving anything yet, so redirecting a browser at it lands on nothing.
+    Every backend that can persist settings without activating them has to set
+    this - the web layer keys the redirect and the banner on it."""
+
+
+VLAN_UNSUPPORTED_MESSAGE = "This network backend cannot create VLAN interfaces."
+DHCP_FQDN_UNSUPPORTED_MESSAGE = "This network backend cannot register a name by DHCP."
 
 
 class NetworkAdapter(ABC):
@@ -89,6 +157,49 @@ class NetworkAdapter(ABC):
     def is_writable(self) -> bool:
         """Return True if this adapter can mutate host state."""
         return True
+
+    def set_dhcp_fqdn(self, fqdn: str, *, reconnect: bool = True) -> ApplyResult:
+        """Send ``fqdn`` as the DHCP client FQDN (option 81) on every interface, or the
+        hostname again when blank, and reconnect each one so its DHCP server sees it now.
+
+        Without ``reconnect`` only what differs is written, and each interface picks it
+        up at its next connect. Never prompts for a password: it runs in the background.
+        """
+        return ApplyResult(ok=False, message=DHCP_FQDN_UNSUPPORTED_MESSAGE)
+
+    def read_address_sources(self) -> list[AddressSourceReading] | None:
+        """Every non-loopback interface's address and its source, for diagnostics.
+
+        Unlike ``list_interfaces`` / ``get_state``, which fall back to a quiet
+        default so the network card keeps working, this keeps what failed:
+        raises :class:`BackendReadError` when the interface list cannot be
+        read, and reports an interface it could not read as ``unreadable``.
+        ``None``: this backend cannot say where an address came from.
+        """
+        return None
+
+    # ---- VLAN sub-interfaces --------------------------------------------
+    #
+    # Creating the link is the whole of the new work: once ``eth0.10`` exists
+    # it is an ordinary netdev, so listing, addressing and pinning it all run
+    # through the paths above unchanged. Backends that do not own links report
+    # unsupported here and the UI omits the controls entirely.
+
+    def supports_vlans(self) -> bool:
+        """Return True if this backend can create and remove VLAN links."""
+        return False
+
+    def list_vlans(self) -> list[VlanInterface]:
+        """Return the VLAN sub-interfaces this backend knows about."""
+        return []
+
+    def create_vlan(self, parent: str, vlan_id: int) -> ApplyResult:
+        """Create a ``<parent>.<vlan_id>`` VLAN link."""
+        return ApplyResult(ok=False, message=VLAN_UNSUPPORTED_MESSAGE)
+
+    def delete_vlan(self, name: str) -> ApplyResult:
+        """Remove the VLAN link named ``name``."""
+        return ApplyResult(ok=False, message=VLAN_UNSUPPORTED_MESSAGE)
 
     def get_ipv6_state(self, iface: str) -> None:
         """Stub for future IPv6 support."""

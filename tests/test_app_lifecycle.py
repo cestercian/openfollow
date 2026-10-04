@@ -140,7 +140,6 @@ class TestConstruction:
         assert app._camera is None
         assert app._canvas is None
         assert app._controlled_ids == []
-        assert app._iface_selection_active is False
         assert app._input_manager is None
         assert app._otp_server is None
         assert app._psn_receiver is None
@@ -269,7 +268,7 @@ class TestRun:
         app._runtime_services.diagnostics_export = export
         app._check_diagnostics_export()
         assert app._runtime_services._status_flags["diagnostics_export"] == (
-            "info",
+            "success",
             "Diagnostics saved to SanDisk Ultra",
         )
 
@@ -613,11 +612,7 @@ class TestDelegators:
             ("_check_controller_slot_actions", "runtime_check_controller_slot_actions", ()),
             ("_check_camera_setup_requests", "runtime_check_camera_setup_requests", ()),
             ("_process_source_selection_input", "runtime_process_source_selection_input", ()),
-            ("_process_iface_selection_input", "runtime_process_iface_selection_input", ()),
             ("_enter_source_selection", "runtime_enter_source_selection", ()),
-            ("_refresh_iface_list", "runtime_refresh_iface_list", ()),
-            ("_enter_iface_selection", "runtime_enter_iface_selection", ()),
-            ("_confirm_iface_selection", "runtime_confirm_iface_selection", ()),
             ("_enter_button_detection", "runtime_enter_button_detection", ()),
             ("_process_button_detection", "runtime_process_button_detection", ()),
             ("_exit_button_detection", "runtime_exit_button_detection", ()),
@@ -681,6 +676,19 @@ class TestDelegators:
 
         app = OpenFollowApp(config_path=patched_ctor.cfg_path)
         assert app._run_frame() is verdict
+
+    def test_observe_network_planes_delegates_to_services(
+        self,
+        patched_ctor,
+        monkeypatch: pytest.MonkeyPatch,  # noqa: ANN001
+    ) -> None:
+        """Housekeeping drives this ~10x/s; it must reach the observer that
+        keeps each plane on its configured interface."""
+        app = OpenFollowApp(config_path=patched_ctor.cfg_path)
+        hits: list[int] = []
+        app._runtime_services.observe_network_planes = lambda: hits.append(1)
+        app._observe_network_planes()
+        assert hits == [1]
 
     @pytest.mark.parametrize(
         ("method_name", "helper_name", "payload"),
@@ -841,19 +849,19 @@ class TestDelegators:
 
 
 def test_sync_system_hostname_delegates(monkeypatch: pytest.MonkeyPatch) -> None:
-    """``_sync_system_hostname`` forwards the broker + station name to
-    ``device_repair.sync_station_hostname``."""
-    calls: list[tuple[Any, str]] = []
+    """``_sync_system_hostname`` forwards the broker, station name and FQDN to
+    ``device_repair.sync_station_hostname``, so /etc/hosts carries the FQDN from boot."""
+    calls: list[tuple[Any, str, str]] = []
     monkeypatch.setattr(
         "openfollow.privilege.device_repair.sync_station_hostname",
-        lambda broker, name: calls.append((broker, name)),
+        lambda broker, name, fqdn: calls.append((broker, name, fqdn)),
     )
     fake = SimpleNamespace(
         _runtime_services=SimpleNamespace(privilege_broker="BROKER"),
-        _config=SimpleNamespace(psn_system_name="Station X"),
+        _config=SimpleNamespace(psn_system_name="Station X", station_fqdn="of-1.stage.example.com"),
     )
     OpenFollowApp._sync_system_hostname(fake)
-    assert calls == [("BROKER", "Station X")]
+    assert calls == [("BROKER", "Station X", "of-1.stage.example.com")]
 
 
 class TestBlurHandler:
@@ -872,3 +880,14 @@ class TestBlurHandler:
         app = OpenFollowApp(config_path=patched_ctor.cfg_path)
         assert app._input_manager is None
         app._on_blur({})  # must not raise
+
+
+def test_startup_reconciles_the_station_fqdn() -> None:
+    """The DHCP side is brought in line with the config at every start, by the runtime services."""
+    asked: list[str] = []
+    fake = SimpleNamespace(
+        _runtime_services=SimpleNamespace(reconcile_station_fqdn=asked.append),
+        _config=SimpleNamespace(station_fqdn="of-1.stage.example.com"),
+    )
+    OpenFollowApp._reconcile_station_fqdn(fake)
+    assert asked == ["of-1.stage.example.com"]

@@ -10,8 +10,10 @@ from pathlib import Path
 
 import psutil
 
+from openfollow.net_utils import read_ipv4_routes
 from openfollow.network.adapter import (
     ApplyResult,
+    BackendReadError,
     Ipv4Config,
     Ipv4Method,
     NetworkAdapter,
@@ -21,7 +23,6 @@ from openfollow.network.adapter import (
 
 logger = logging.getLogger(__name__)
 _RESOLV_CONF = Path("/etc/resolv.conf")
-_PROC_ROUTE = Path("/proc/net/route")
 
 
 def _netmask_to_prefix(netmask: str | None) -> int | None:
@@ -55,31 +56,42 @@ def _read_dns() -> tuple[str, ...]:
 
 
 def _read_gateway(iface: str) -> str | None:
-    if not _PROC_ROUTE.exists():
+    routes = read_ipv4_routes()
+    if routes is None:
         return None
+    # A default route through a gateway, the one the kernel prefers first.
+    defaults = [r for r in routes if r.iface == iface and r.network.prefixlen == 0 and r.gateway != "0.0.0.0"]
+    return min(defaults, key=lambda r: r.metric).gateway if defaults else None
+
+
+def read_interfaces() -> list[NetworkInterface]:
+    """Every interface psutil reports; raises :class:`BackendReadError` when it cannot."""
     try:
-        for line in _PROC_ROUTE.read_text().splitlines()[1:]:
-            fields = line.split()
-            if len(fields) < 4:
-                continue
-            name, dest_hex, gw_hex, flags_hex = fields[0], fields[1], fields[2], fields[3]
-            if name != iface or dest_hex != "00000000":
-                continue
-            try:
-                flags = int(flags_hex, 16)
-            except ValueError:
-                continue
-            if not (flags & 0x2):  # Platform-specific RTF_GATEWAY flag
-                continue
-            try:
-                gw_int = int(gw_hex, 16)
-            except ValueError:
-                continue
-            packed = gw_int.to_bytes(4, "little")
-            return socket.inet_ntoa(packed)
-    except OSError:
-        return None
-    return None
+        stats = psutil.net_if_stats()
+        addrs = psutil.net_if_addrs()
+    except Exception as exc:  # noqa: BLE001 - psutil raises bare Exception on some hosts
+        raise BackendReadError(f"psutil: {exc!r}") from exc
+    out: list[NetworkInterface] = []
+    for name, addr_list in addrs.items():
+        mac: str | None = None
+        for addr in addr_list:
+            family = getattr(addr, "family", None)
+            if family is not None and getattr(family, "name", "") in (
+                "AF_LINK",
+                "AF_PACKET",
+            ):
+                mac = addr.address
+                break
+        stat = stats.get(name)
+        out.append(
+            NetworkInterface(
+                name=name,
+                mac=mac,
+                kind=None,
+                is_up=bool(stat and stat.isup),
+            )
+        )
+    return out
 
 
 class PsutilReadOnlyAdapter(NetworkAdapter):
@@ -87,31 +99,9 @@ class PsutilReadOnlyAdapter(NetworkAdapter):
 
     def list_interfaces(self) -> list[NetworkInterface]:
         try:
-            stats = psutil.net_if_stats()
-            addrs = psutil.net_if_addrs()
-        except Exception:  # noqa: BLE001 - psutil raises bare Exception on some hosts
+            return read_interfaces()
+        except BackendReadError:
             return []
-        out: list[NetworkInterface] = []
-        for name, addr_list in addrs.items():
-            mac: str | None = None
-            for addr in addr_list:
-                family = getattr(addr, "family", None)
-                if family is not None and getattr(family, "name", "") in (
-                    "AF_LINK",
-                    "AF_PACKET",
-                ):
-                    mac = addr.address
-                    break
-            stat = stats.get(name)
-            out.append(
-                NetworkInterface(
-                    name=name,
-                    mac=mac,
-                    kind=None,
-                    is_up=bool(stat and stat.isup),
-                )
-            )
-        return out
 
     def get_state(self, iface: str) -> NetworkState | None:
         ifaces = {i.name: i for i in self.list_interfaces()}

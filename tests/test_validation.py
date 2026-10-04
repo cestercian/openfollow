@@ -260,6 +260,54 @@ def test_validate_service_name() -> None:
     assert err is not None
 
 
+@pytest.mark.parametrize(
+    "raw",
+    ["of-1.stage.example.com", "Of-1.Stage.Example.COM.", "  of-1.example.com  ", ""],
+    ids=["plain", "any-case-root-dot", "padded", "blank-clears"],
+)
+def test_a_station_fqdn_the_station_will_store_passes(raw: str) -> None:
+    assert validate("general", "station_fqdn", raw) is None
+
+
+@pytest.mark.parametrize(
+    ("raw", "message"),
+    [
+        ("of-1", "Enter the full name with its domain, such as of-1.stage.example.com."),
+        (".", "Enter the full name with its domain, such as of-1.stage.example.com."),
+        (" . ", "Enter the full name with its domain, such as of-1.stage.example.com."),
+        ("192.0.2.10", "Enter a name, not an IP address."),
+        ("of-1.local", "Names under .local are mDNS names, and the station already answers to its own."),
+        (
+            "of_1.example.com",
+            "Use only letters, digits and hyphens between the dots, and no hyphen at the start or end of a part.",
+        ),
+        (
+            "-of-1.example.com",
+            "Use only letters, digits and hyphens between the dots, and no hyphen at the start or end of a part.",
+        ),
+        ("a" * 64 + ".example.com", "Each part between dots is at most 63 characters."),
+        (".".join(["a" * 63, "b" * 63, "c" * 63, "d" * 62]), "A name is at most 253 characters."),
+        ("a" * 255, "Must be at most 254 characters."),
+        ("of-1\u202e.example.com", "Remove control or text-direction characters."),
+    ],
+    ids=[
+        "one-label",
+        "root-only",
+        "padded-root-only",
+        "ip",
+        "mdns",
+        "underscore",
+        "edge-hyphen",
+        "label-over-63",
+        "name-over-253",
+        "input-over-254",
+        "bidi",
+    ],
+)
+def test_a_station_fqdn_the_station_would_refuse_says_why(raw: str, message: str) -> None:
+    assert validate("general", "station_fqdn", raw) == message
+
+
 def test_validate_model_traversal_rejected() -> None:
     err = validate("detection", "model", "../../yolov8n.onnx")
     assert err is not None
@@ -1097,3 +1145,42 @@ def test_needs_cfg_false_for_every_rule() -> None:
     for section, rules in FIELD_RULES.items():
         for field_name, rule in rules.items():
             assert needs_cfg(rule) is False, f"{section}.{field_name}"
+
+
+# ---------------------------------------------------------------------------
+# network.label: an interface's label on its Network Interface row
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("value", ["Lighting", "FOH Lighting Main 01", "", "  Bühne  "])
+def test_network_label_accepts_up_to_twenty_characters(value: str) -> None:
+    assert validate("network", "label", value) is None
+
+
+def test_network_label_refuses_more_than_twenty_characters() -> None:
+    assert validate("network", "label", "L" * 21) == "Must be at most 20 characters."
+
+
+@pytest.mark.parametrize("value", ["Light\x00ing", "Light\u202eing"])
+def test_network_label_refuses_control_and_direction_characters(value: str) -> None:
+    assert validate("network", "label", value) == "Remove control or text-direction characters."
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "Light\u2066ing",
+        "Light\u2067ing",
+        "Light\u2068ing",
+        "Light\u2069ing",
+        "Light\u061cing",
+        "Light\x85ing",
+        "Light\x9bing",
+    ],
+    ids=["LRI", "RLI", "FSI", "PDI", "ALM", "C1-NEL", "C1-CSI"],
+)
+def test_bidi_isolates_and_c1_controls_are_refused_and_stripped(value: str) -> None:
+    """The isolates reorder text like the overrides do, and a C1 control is no
+    more at home in a config field than a C0 one."""
+    assert validate("network", "label", value) == "Remove control or text-direction characters."
+    assert _default_sanitiser(value) == "Lighting"

@@ -116,6 +116,12 @@ def test_osc_destinations_partial_inputs_are_audited() -> None:
     assert ("osc_destinations.tpl", "name") in audited
 
 
+def test_the_network_label_input_is_audited() -> None:
+    """Its error span id carries the row index, so a VLAN name's dot never reaches a CSS selector."""
+    audited = {(path.name, attrs["name"]) for path, _section, attrs in _registered_inputs()}
+    assert ("network.tpl", "label") in audited
+
+
 def test_every_registered_input_has_validation_markup() -> None:
     missing: list[str] = []
     for path, section, attrs in _registered_inputs():
@@ -183,13 +189,17 @@ def test_aria_invalid_starts_false() -> None:
 
 
 def test_hx_include_closest_form_for_cross_field_context() -> None:
-    """Inputs include the rest of the form so cross-field notes work."""
+    """Inputs include the rest of the form so cross-field notes work. An input joined to a
+    form outside it by ``form=`` names that form: ``closest form`` finds no ancestor there,
+    and htmx throws on the missing match instead of sending the check."""
     bad: list[str] = []
     for path, _section, attrs in _registered_inputs():
         if "hx-get" not in attrs:
             continue
-        if "closest form" not in attrs.get("hx-include", ""):
-            bad.append(f'{path.name}: input name={attrs.get("name")!r} missing hx-include="closest form"')
+        owner = attrs.get("form")
+        expected = f"#{owner}" if owner else "closest form"
+        if attrs.get("hx-include", "") != expected:
+            bad.append(f'{path.name}: input name={attrs.get("name")!r} needs hx-include="{expected}"')
     assert not bad, "missing hx-include:\n  " + "\n  ".join(bad)
 
 

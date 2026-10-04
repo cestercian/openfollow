@@ -13,13 +13,17 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from openfollow.network.adapter import (
+    AddressSourceReading,
     ApplyResult,
+    BackendReadError,
     Ipv4Config,
     Ipv4Method,
     LeaseInfo,
     NetworkAdapter,
     NetworkInterface,
     NetworkState,
+    address_source_of,
+    is_loopback,
 )
 from openfollow.network.validate import validate_apply
 from openfollow.privilege.broker import PrivilegeBroker, PrivilegeError
@@ -50,8 +54,28 @@ class _BrokerCallResult:
     detail: str
 
 
+# Shown when the privilege broker is absent, which on a real device means the
+# sudoers rules were never installed. "Broker not configured." named an
+# internal object and left the operator with nothing to try.
+_NO_BROKER_MESSAGE = "Cannot change network settings - the privileged helper is not configured."
+
 _BLOCK_START = "# >>> openfollow managed: {iface} >>>"
 _BLOCK_END = "# <<< openfollow managed: {iface} <<<"
+# The station FQDN's block: global options, so it names no interface, and the
+# space keeps it from ever sharing markers with an interface's block.
+_FQDN_BLOCK = "station fqdn"
+_FQDN_BLOCK_RE = re.compile(
+    rf"^# >>> openfollow managed: {_FQDN_BLOCK} >>>\n.*?^# <<< openfollow managed: {_FQDN_BLOCK} <<<\n\n?",
+    re.DOTALL | re.MULTILINE,
+)
+# Its start marker with the end gone: only the marker and the directives it manages go,
+# never the global options an operator wrote after it.
+_FQDN_ORPHAN_RE = re.compile(
+    rf"^# >>> openfollow managed: {_FQDN_BLOCK} >>>[ \t]*(?:\n|\Z)(?:(?:hostname|fqdn)\b[^\n]*(?:\n|\Z))*",
+    re.MULTILINE,
+)
+# Where the global part ends: the first section, or a managed block's marker above one.
+_GLOBAL_END_RE = re.compile(r"^(?:[ \t]*(?:interface|ssid|profile)\s|# >>> openfollow managed: )", re.MULTILINE)
 _DHCPCD_TIMEOUT = 8
 # ``dhcpcd -n`` rebinds asynchronously, so the address read-back can still
 # report the old lease for a moment. Poll a few times with a short settle so
@@ -99,7 +123,17 @@ class DhcpcdAdapter(NetworkAdapter):
         except OSError:
             return ""
 
-    def _write_conf_privileged(self, text: str) -> None:
+    def _read_conf_for_write(self) -> str:
+        """The conf a rewrite starts from: a missing file is empty, an unreadable one raises.
+
+        Read as empty, an unreadable conf would be replaced by the managed blocks alone.
+        """
+        try:
+            return self.conf_path.read_text()
+        except FileNotFoundError:
+            return ""
+
+    def _write_conf_privileged(self, text: str, *, allow_prompt: bool = True) -> None:
         """Rewrite the conf atomically, or write directly in tests.
 
         Production path (broker + real ``/etc/dhcpcd.conf``): stage the
@@ -120,12 +154,14 @@ class DhcpcdAdapter(NetworkAdapter):
             stdin=text,
             reason="Apply IPv4 network changes (stage dhcpcd.conf)",
             timeout=10,
+            allow_prompt=allow_prompt,
         )
         self._broker.run(
             NETWORK_DHCPCD_CONF_COMMIT,
             ["/usr/bin/mv", str(DHCPCD_CONF_TMP), str(DHCPCD_CONF)],
             reason="Apply IPv4 network changes (commit dhcpcd.conf)",
             timeout=10,
+            allow_prompt=allow_prompt,
         )
 
     @staticmethod
@@ -193,6 +229,33 @@ class DhcpcdAdapter(NetworkAdapter):
         lines.append(_BLOCK_END.format(iface=iface))
         return "\n".join(lines) + "\n"
 
+    @classmethod
+    def _with_fqdn_block(cls, text: str, fqdn: str) -> str:
+        """``text`` carrying the station FQDN as the last of its global options, or without it when blank.
+
+        ``hostname`` alone sends the whole name as option 12; ``fqdn both`` makes it option 81.
+        The block brings its own trailing blank line and takes it away again, so removing it
+        gives back the file as it was, ending in a newline if it did not.
+        """
+        text = _FQDN_ORPHAN_RE.sub("", _FQDN_BLOCK_RE.sub("", text))
+        if not fqdn:
+            return text
+        block = (
+            "\n".join(
+                [
+                    _BLOCK_START.format(iface=_FQDN_BLOCK),
+                    f"hostname {fqdn}",
+                    "fqdn both",
+                    _BLOCK_END.format(iface=_FQDN_BLOCK),
+                ]
+            )
+            + "\n"
+        )
+        end = _GLOBAL_END_RE.search(text)
+        if end is None:
+            return text + ("\n" if text and not text.endswith("\n") else "") + block
+        return text[: end.start()] + block + "\n" + text[end.start() :]
+
     # ---- list / get -----------------------------------------------------
 
     def list_interfaces(self) -> list[NetworkInterface]:
@@ -235,8 +298,8 @@ class DhcpcdAdapter(NetworkAdapter):
         )
         return NetworkState(interface=ifaces[iface], ipv4=ipv4, lease=lease)
 
-    def _detect_method(self, iface: str) -> Ipv4Method:
-        block = self._extract_block_text(iface)
+    def _detect_method(self, iface: str, conf: str | None = None) -> Ipv4Method:
+        block = self._extract_block_text(iface, conf)
         if block is None:
             return Ipv4Method.DHCP
         if "static ip_address=" in block:
@@ -245,8 +308,9 @@ class DhcpcdAdapter(NetworkAdapter):
             return Ipv4Method.DHCP_WITH_MANUAL_ADDRESS
         return Ipv4Method.DHCP
 
-    def _extract_block_text(self, iface: str) -> str | None:
-        text = self._read_conf()
+    def _extract_block_text(self, iface: str, conf: str | None = None) -> str | None:
+        """The managed block for *iface* in *conf*, or in the conf on disk when not given."""
+        text = self._read_conf() if conf is None else conf
         pattern = re.compile(
             rf"# >>> openfollow managed: {re.escape(iface)} >>>(.*?)"
             rf"# <<< openfollow managed: {re.escape(iface)} <<<",
@@ -255,8 +319,8 @@ class DhcpcdAdapter(NetworkAdapter):
         match = pattern.search(text)
         return match.group(1) if match else None
 
-    def _read_managed_overrides(self, iface: str) -> dict[str, object] | None:
-        block = self._extract_block_text(iface)
+    def _read_managed_overrides(self, iface: str, conf: str | None = None) -> dict[str, object] | None:
+        block = self._extract_block_text(iface, conf)
         if block is None:
             return None
         out: dict[str, object] = {}
@@ -283,17 +347,27 @@ class DhcpcdAdapter(NetworkAdapter):
 
     def _read_lease(self, iface: str) -> LeaseInfo | None:
         try:
+            return self._parse_lease(self._lease_text(iface))
+        except BackendReadError:
+            return None
+
+    def _lease_text(self, iface: str) -> str:
+        """``dhcpcd -U`` output, ``""`` when dhcpcd holds no lease; raises when it cannot be asked."""
+        try:
             res = self._run(["dhcpcd", "-U", iface], check=False)
-        except (FileNotFoundError, subprocess.SubprocessError):
-            return None
-        if res.returncode != 0 or not res.stdout.strip():
-            return None
+        except (FileNotFoundError, subprocess.SubprocessError) as exc:
+            raise BackendReadError(str(exc)) from exc
+        return res.stdout if res.returncode == 0 else ""
+
+    @staticmethod
+    def _parse_lease(text: str) -> LeaseInfo | None:
+        """The lease in ``dhcpcd -U`` output; None when it names no address, router or DNS."""
         addr: str | None = None
         prefix: int | None = None
         router: str | None = None
         dns: list[str] = []
         lease_seconds: int | None = None
-        for line in res.stdout.splitlines():
+        for line in text.splitlines():
             line = line.strip()
             if "=" not in line:
                 continue
@@ -329,6 +403,32 @@ class DhcpcdAdapter(NetworkAdapter):
             lease_seconds_remaining=lease_seconds,
         )
 
+    # ---- diagnostics ----------------------------------------------------
+
+    def read_address_sources(self) -> list[AddressSourceReading]:
+        from openfollow.network.psutil_adapter import read_interfaces
+
+        names = [i.name for i in read_interfaces() if not is_loopback(i)]
+        try:
+            conf = self.conf_path.read_text()
+        except OSError as exc:
+            reason = f"could not read {self.conf_path}: {exc.strerror or exc}"
+            return [AddressSourceReading(name, "", "unreadable", reason) for name in names]
+        return [self._address_source(name, conf) for name in names]
+
+    def _address_source(self, iface: str, conf: str) -> AddressSourceReading:
+        method = self._detect_method(iface, conf)
+        if method is Ipv4Method.DHCP:
+            try:
+                lease = self._parse_lease(self._lease_text(iface))
+            except BackendReadError as exc:
+                return AddressSourceReading(iface, "", "unreadable", str(exc))
+            address = lease.address if lease else None
+        else:
+            override = (self._read_managed_overrides(iface, conf) or {}).get("address")
+            address = override if isinstance(override, str) else None
+        return AddressSourceReading(iface, address or "", address_source_of(address, method))
+
     # ---- mutation -------------------------------------------------------
 
     def apply_ipv4(self, iface: str, config: Ipv4Config) -> ApplyResult:
@@ -337,13 +437,16 @@ class DhcpcdAdapter(NetworkAdapter):
         # ``parse_ipv4`` (via validate_apply) rejects embedded newlines, which
         # blocks injecting extra directives into the conf.
         if not _IFACE_RE.fullmatch(iface):
-            return ApplyResult(ok=False, message=f"Invalid interface name: {iface!r}")
+            return ApplyResult(
+                ok=False,
+                message=f"{iface!r} is not a valid interface name, so nothing was changed.",
+            )
         errors = validate_apply(config.method, config.address, config.prefix, config.router, list(config.dns))
         if errors:
             return ApplyResult(ok=False, message="; ".join(errors))
 
         try:
-            current = self._read_conf()
+            current = self._read_conf_for_write()
             stripped = self._strip_block(current, iface)
             block = self._build_block(iface, config)
             new_text = stripped.rstrip() + "\n\n" + block if stripped.strip() else block
@@ -352,9 +455,20 @@ class DhcpcdAdapter(NetworkAdapter):
             except PrivilegeError as exc:
                 return ApplyResult(ok=False, message=str(exc))
             except OSError as exc:
-                return ApplyResult(ok=False, message=f"Cannot write {self.conf_path}: {exc}")
+                return ApplyResult(
+                    ok=False,
+                    message=(
+                        f"Could not write {self.conf_path}; check it exists and is not mounted read-only ({exc})."
+                    ),
+                )
         except Exception as exc:  # noqa: BLE001
-            return ApplyResult(ok=False, message=f"Failed to update dhcpcd.conf: {exc}")
+            return ApplyResult(
+                ok=False,
+                message=(
+                    f"Could not update {self.conf_path}; nothing was changed and {iface} keeps its "
+                    f"current settings ({exc})."
+                ),
+            )
 
         partial: list[str] = []
         release = self._broker_run(
@@ -375,7 +489,7 @@ class DhcpcdAdapter(NetworkAdapter):
         # prior conf so the next reload/reboot doesn't silently come up on it.
         if rebind is None:
             self._restore_conf(current)
-            return ApplyResult(ok=False, message="Broker not configured.")
+            return ApplyResult(ok=False, message=_NO_BROKER_MESSAGE)
         if not rebind.ok:
             reload_ = self._broker_run(
                 NETWORK_DHCPCD_RELOAD,
@@ -396,8 +510,8 @@ class DhcpcdAdapter(NetworkAdapter):
                 return ApplyResult(
                     ok=False,
                     message=(
-                        f"dhcpcd -n failed ({rebind.detail}); systemctl reload dhcpcd also failed: {detail}. "
-                        f"Restored the prior config; the device may need a manual retry."
+                        f"Could not apply the new config so the previous one was restored; {iface} may "
+                        f"need a manual retry (dhcpcd -n: {rebind.detail}; reload: {detail})."
                     ),
                 )
             partial.append(f"dhcpcd -n: {rebind.detail} (fell back to systemctl reload)")
@@ -405,7 +519,65 @@ class DhcpcdAdapter(NetworkAdapter):
         warning = self._verify_static_applied(iface, config)
         if warning:
             partial.append(warning)
+        if not self._has_carrier(iface):
+            # ``dhcpcd -n`` returns 0 on a carrier-less interface - it only
+            # signals the daemon - so without this the apply reads as clean and
+            # the web layer redirects the browser to an address nothing is
+            # serving yet.
+            return ApplyResult(
+                ok=True,
+                pending=True,
+                message=f"Saved; the settings take effect when {iface} has a link.",
+                partial_failures=tuple(partial),
+            )
         return ApplyResult(ok=True, message="Applied.", partial_failures=tuple(partial))
+
+    def set_dhcp_fqdn(self, fqdn: str, *, reconnect: bool = True) -> ApplyResult:
+        try:
+            current = self._read_conf_for_write()
+        except (OSError, UnicodeDecodeError) as exc:
+            return ApplyResult(ok=False, message=f"Could not read {self.conf_path}, so nothing was changed ({exc}).")
+        updated = self._with_fqdn_block(current, fqdn)
+        if updated != current:
+            try:
+                self._write_conf_privileged(updated, allow_prompt=False)
+            except PrivilegeError as exc:
+                return ApplyResult(ok=False, message=str(exc))
+            except OSError as exc:
+                return ApplyResult(
+                    ok=False,
+                    message=f"Could not write {self.conf_path}; check it exists and is not mounted read-only ({exc}).",
+                )
+        if not reconnect:
+            return ApplyResult(ok=True, message="Applied." if updated != current else "Unchanged.")
+        failures: list[str] = []
+        for iface in self.list_interfaces():
+            if is_loopback(iface) or not _IFACE_RE.fullmatch(iface.name):
+                continue
+            # ``-n`` rereads the conf and rebinds, so the next request carries the name.
+            rebind = self._broker_run(
+                NETWORK_DHCPCD_RENEW,
+                ["/usr/sbin/dhcpcd", "-n", iface.name],
+                reason=f"Reconnect {iface.name} so its DHCP server sees the name",
+                allow_prompt=False,
+            )
+            if rebind is None:
+                return ApplyResult(ok=False, message=_NO_BROKER_MESSAGE)
+            if not rebind.ok:
+                failures.append(f"{iface.name} could not be reconnected ({rebind.detail}).")
+        return ApplyResult(ok=True, message="Applied.", partial_failures=tuple(failures))
+
+    def _has_carrier(self, iface: str) -> bool:
+        """False only when the kernel explicitly reports the link is down.
+
+        An unreadable state counts as having carrier, so an apply we can't
+        explain is never downgraded to a reassuring "saved, pending".
+        """
+        try:
+            state = Path(f"/sys/class/net/{iface}/operstate").read_text(encoding="utf-8").strip()
+        except OSError:
+            return True
+        return state != "down"
 
     def _restore_conf(self, text: str) -> None:
         """Best-effort restore of the prior conf after a failed bounce.
@@ -456,9 +628,12 @@ class DhcpcdAdapter(NetworkAdapter):
             reason=f"Renew DHCP lease on {iface}",
         )
         if result is None:
-            return ApplyResult(ok=False, message="Broker not configured.")
+            return ApplyResult(ok=False, message=_NO_BROKER_MESSAGE)
         if not result.ok:
-            return ApplyResult(ok=False, message=result.detail)
+            return ApplyResult(
+                ok=False,
+                message=f"Could not renew the lease on {iface}. {result.detail}".strip(),
+            )
         return ApplyResult(ok=True, message="Lease renewed.")
 
     def _broker_run(
@@ -467,6 +642,7 @@ class DhcpcdAdapter(NetworkAdapter):
         argv: list[str],
         *,
         reason: str,
+        allow_prompt: bool = True,
     ) -> _BrokerCallResult | None:
         """Invoke the broker, return a small (ok, detail) value, never raise.
 
@@ -483,6 +659,7 @@ class DhcpcdAdapter(NetworkAdapter):
                 argv,
                 reason=reason,
                 timeout=_DHCPCD_TIMEOUT,
+                allow_prompt=allow_prompt,
             )
         except PrivilegeError as exc:
             return _BrokerCallResult(ok=False, detail=str(exc))
